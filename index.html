@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080, height=1920, initial-scale=1.0">
+<title>OneBeat</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas {
+    display: block;
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    /* Scaled to fit viewport while maintaining aspect ratio */
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ============================================================
+// CONFIG – all tunable constants
+// ============================================================
+const CFG = {
+  // Canvas / display
+  W: 1080,
+  H: 1920,
+
+  // Colors
+  COLOR_IDLE_BG:     '#6B8E4E',
+  COLOR_ACTIVE_BG:   '#D8DDB5',
+  COLOR_WATER_IDLE:  '#5A7D3A',
+  COLOR_WATER_ACTIVE:'#8BA86A',
+  COLOR_BUBBLE_IDLE: '#F5F2E8',   // cream/white
+  COLOR_BUBBLE_ACTIVE:'#4A6E2E',  // dark green
+  COLOR_BUBBLE_RING: '#3D5C24',
+
+  // Water
+  WATER_Y_MIN: 1.05,    // fraction of H (offscreen below) when 0 buttons
+  WATER_Y_MAX: 0.08,    // fraction of H (near top) when 8 buttons
+  WATER_WAVE_AMP1: 12,
+  WATER_WAVE_AMP2: 8,
+  WATER_WAVE_FREQ1: 0.008,
+  WATER_WAVE_FREQ2: 0.013,
+  WATER_WAVE_SPEED1: 1.5,
+  WATER_WAVE_SPEED2: -1.0,
+  WATER_LERP_SPEED: 0.02,
+  WATER_BUBBLE_COUNT: 20,
+  WATER_BUBBLE_MIN_R: 2,
+  WATER_BUBBLE_MAX_R: 6,
+  WATER_BUBBLE_SPEED: 0.4,
+
+  // Background network
+  BG_DOT_COUNT: 55,
+  BG_DOT_SPEED: 0.3,
+  BG_CONNECT_DIST: 180,
+  BG_DOT_RADIUS: 3,
+  BG_LINE_ALPHA: 0.25,
+  BG_DOT_ALPHA: 0.5,
+
+  // State transitions
+  BG_COLOR_LERP: 0.03,
+
+  // Center bubble
+  CENTER_IDLE_RADIUS: 250,
+  CENTER_ACTIVE_MIN_R: 80,
+  CENTER_ACTIVE_MAX_R: 200,
+  CENTER_ACTIVE_MIN_Y: 0.78,  // fraction of H (bottom area)
+  CENTER_ACTIVE_MAX_Y: 0.45,  // fraction of H (moves up)
+  CENTER_FULL_RADIUS: 280,
+
+  // PNG bubble animation
+  BUBBLE_SPAWN_DURATION: 4000,   // ms total lifecycle
+  BUBBLE_FADE_IN: 400,           // ms
+  BUBBLE_TEXT_FADE_OUT: 800,     // ms before end
+  BUBBLE_FADE_OUT: 400,          // ms at end
+  BUBBLE_DRIFT_Y: 200,           // px drift down
+  BUBBLE_SHRINK: 0.5,            // final scale factor
+  BUBBLE_START_RADIUS: 100,
+
+  // Full state
+  FULL_TIMEOUT: 2000,            // ms delay before tech-rings appear
+  TECH_RING_FADE_IN: 1000,       // ms
+
+  // Idle rotation
+  IDLE_ROTATE_SPEED: 0.0003,     // radians per ms
+
+  // Circle decorations (idle state)
+  IDLE_DECOR_COUNT: 12,
+  IDLE_DECOR_MIN_R: 8,
+  IDLE_DECOR_MAX_R: 30,
+};
+
+// ============================================================
+// CANVAS SETUP
+// ============================================================
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = CFG.W;
+canvas.height = CFG.H;
+
+function fitCanvas() {
+  const scaleX = window.innerWidth / CFG.W;
+  const scaleY = window.innerHeight / CFG.H;
+  const scale = Math.min(scaleX, scaleY);
+  canvas.style.width = (CFG.W * scale) + 'px';
+  canvas.style.height = (CFG.H * scale) + 'px';
+}
+fitCanvas();
+window.addEventListener('resize', fitCanvas);
+
+// ============================================================
+// INPUT ABSTRACTION
+// ============================================================
+const buttons = new Array(8).fill(false);
+let activeCount = 0;
+
+function updateActiveCount() {
+  activeCount = buttons.filter(Boolean).length;
+}
+
+function onButtonDown(idx) {
+  if (idx < 0 || idx > 7 || buttons[idx]) return;
+  buttons[idx] = true;
+  updateActiveCount();
+  spawnPNGBubble(idx);
+  onStateChange();
+}
+
+function onButtonUp(idx) {
+  if (idx < 0 || idx > 7 || !buttons[idx]) return;
+  buttons[idx] = false;
+  updateActiveCount();
+  onStateChange();
+}
+
+// -- Keyboard simulation (dev) --
+const KEY_MAP = { '1':0, '2':1, '3':2, '4':3, '5':4, '6':5, '7':6, '8':7 };
+
+document.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  const idx = KEY_MAP[e.key];
+  if (idx !== undefined) onButtonDown(idx);
+});
+
+document.addEventListener('keyup', (e) => {
+  const idx = KEY_MAP[e.key];
+  if (idx !== undefined) onButtonUp(idx);
+});
+
+// -- BrightSign serial (production) --
+let serialIn = null;
+let serialOut = null;
+
+function initBrightSignSerial() {
+  if (typeof BSSerialPort === 'undefined') return;
+  try {
+    // Input: XT-1GW6 touchbuttons
+    serialIn = new BSSerialPort('/dev/ttyUSB0');
+    serialIn.SetBaudRate(9600);
+    serialIn.SetDataBits(8);
+    serialIn.SetStopBits(1);
+    serialIn.SetParity('none');
+
+    let inputBuffer = '';
+    serialIn.ondata = function(data) {
+      inputBuffer += data;
+      let lines = inputBuffer.split('\n');
+      inputBuffer = lines.pop();
+      for (const line of lines) {
+        parseSerialCommand(line.trim());
+      }
+      // Also try parsing without newline for single commands
+      if (inputBuffer.match(/^[1-8][+-]$/)) {
+        parseSerialCommand(inputBuffer);
+        inputBuffer = '';
+      }
+    };
+
+    // Output: Teensy
+    serialOut = new BSSerialPort('/dev/ttyUSB1');
+    serialOut.SetBaudRate(9600);
+    serialOut.SetDataBits(8);
+    serialOut.SetStopBits(1);
+    serialOut.SetParity('none');
+  } catch (e) {
+    console.warn('Serial init failed:', e);
+  }
+}
+
+function parseSerialCommand(cmd) {
+  const match = cmd.match(/^([1-8])([+-])$/);
+  if (!match) return;
+  const idx = parseInt(match[1]) - 1;
+  if (match[2] === '+') {
+    onButtonDown(idx);
+  } else {
+    onButtonUp(idx);
+  }
+  // Forward to Teensy
+  if (serialOut) {
+    try { serialOut.Write(cmd + '\n'); } catch(e) {}
+  }
+}
+
+initBrightSignSerial();
+
+// ============================================================
+// STATE MACHINE
+// ============================================================
+const STATE = { IDLE: 0, ACTIVE: 1, FULL: 2 };
+let currentState = STATE.IDLE;
+let fullTimeout = null;
+
+function onStateChange() {
+  const prevState = currentState;
+
+  if (activeCount === 0) {
+    if (fullTimeout) { clearTimeout(fullTimeout); fullTimeout = null; }
+    currentState = STATE.IDLE;
+    fullAlpha = 0;
+  } else if (activeCount < 8) {
+    if (fullTimeout) { clearTimeout(fullTimeout); fullTimeout = null; }
+    currentState = STATE.ACTIVE;
+    fullAlpha = 0;
+  } else {
+    // All 8 pressed — stay in ACTIVE briefly, then transition to FULL
+    if (currentState !== STATE.FULL && !fullTimeout) {
+      fullTimeout = setTimeout(() => {
+        currentState = STATE.FULL;
+        fullTimeout = null;
+      }, CFG.FULL_TIMEOUT);
+    }
+  }
+}
+
+// ============================================================
+// COLOR UTILITIES
+// ============================================================
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return [r, g, b];
+}
+
+function rgbToStr(rgb) {
+  return `rgb(${Math.round(rgb[0])},${Math.round(rgb[1])},${Math.round(rgb[2])})`;
+}
+
+function rgbaToStr(rgb, a) {
+  return `rgba(${Math.round(rgb[0])},${Math.round(rgb[1])},${Math.round(rgb[2])},${a})`;
+}
+
+function lerpRgb(a, b, t) {
+  return [
+    a[0] + (b[0] - a[0]) * t,
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+  ];
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+const RGB_IDLE_BG = hexToRgb(CFG.COLOR_IDLE_BG);
+const RGB_ACTIVE_BG = hexToRgb(CFG.COLOR_ACTIVE_BG);
+
+let currentBgRgb = [...RGB_IDLE_BG];
+
+// ============================================================
+// BACKGROUND NETWORK ANIMATION
+// ============================================================
+class Dot {
+  constructor() { this.reset(true); }
+
+  reset(initial) {
+    this.x = Math.random() * CFG.W;
+    this.y = Math.random() * CFG.H;
+    const angle = Math.random() * Math.PI * 2;
+    const speed = (Math.random() * 0.5 + 0.5) * CFG.BG_DOT_SPEED;
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+  }
+
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    // Wrap around
+    if (this.x < -20) this.x = CFG.W + 20;
+    if (this.x > CFG.W + 20) this.x = -20;
+    if (this.y < -20) this.y = CFG.H + 20;
+    if (this.y > CFG.H + 20) this.y = -20;
+  }
+}
+
+// Create dots with cluster-like distribution
+const bgDots = [];
+function initBgDots() {
+  // Create cluster centers
+  const clusterCount = 5 + Math.floor(Math.random() * 3);
+  const clusters = [];
+  for (let i = 0; i < clusterCount; i++) {
+    clusters.push({
+      x: Math.random() * CFG.W,
+      y: Math.random() * CFG.H,
+      r: 100 + Math.random() * 200,
+    });
+  }
+
+  for (let i = 0; i < CFG.BG_DOT_COUNT; i++) {
+    const dot = new Dot();
+    // 70% chance to place near a cluster
+    if (Math.random() < 0.7) {
+      const cl = clusters[Math.floor(Math.random() * clusters.length)];
+      const ang = Math.random() * Math.PI * 2;
+      const dist = Math.random() * cl.r;
+      dot.x = cl.x + Math.cos(ang) * dist;
+      dot.y = cl.y + Math.sin(ang) * dist;
+      // Clamp to screen
+      dot.x = clamp(dot.x, 0, CFG.W);
+      dot.y = clamp(dot.y, 0, CFG.H);
+    }
+    bgDots.push(dot);
+  }
+}
+initBgDots();
+
+function drawBackground() {
+  // Determine line/dot color based on current bg (contrast)
+  const brightness = (currentBgRgb[0] * 299 + currentBgRgb[1] * 587 + currentBgRgb[2] * 114) / 1000;
+  const lineColor = brightness > 140
+    ? [currentBgRgb[0] * 0.7, currentBgRgb[1] * 0.7, currentBgRgb[2] * 0.7]
+    : [currentBgRgb[0] * 1.3, currentBgRgb[1] * 1.3, currentBgRgb[2] * 1.3];
+
+  // Update dots
+  for (const dot of bgDots) dot.update();
+
+  // Draw connections
+  ctx.lineWidth = 1;
+  for (let i = 0; i < bgDots.length; i++) {
+    for (let j = i + 1; j < bgDots.length; j++) {
+      const dx = bgDots[i].x - bgDots[j].x;
+      const dy = bgDots[i].y - bgDots[j].y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < CFG.BG_CONNECT_DIST) {
+        const alpha = (1 - dist / CFG.BG_CONNECT_DIST) * CFG.BG_LINE_ALPHA;
+        ctx.strokeStyle = rgbaToStr(lineColor, alpha);
+        ctx.beginPath();
+        ctx.moveTo(bgDots[i].x, bgDots[i].y);
+        ctx.lineTo(bgDots[j].x, bgDots[j].y);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // Draw dots
+  for (const dot of bgDots) {
+    ctx.fillStyle = rgbaToStr(lineColor, CFG.BG_DOT_ALPHA);
+    ctx.beginPath();
+    ctx.arc(dot.x, dot.y, CFG.BG_DOT_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ============================================================
+// WATER ANIMATION
+// ============================================================
+let waterTargetY = CFG.H * CFG.WATER_Y_MIN;
+let waterCurrentY = waterTargetY;
+let waterTime = 0;
+
+// Water bubbles
+class WaterBubble {
+  constructor() { this.reset(); }
+
+  reset() {
+    this.x = Math.random() * CFG.W;
+    this.r = CFG.WATER_BUBBLE_MIN_R + Math.random() * (CFG.WATER_BUBBLE_MAX_R - CFG.WATER_BUBBLE_MIN_R);
+    this.speed = (Math.random() * 0.5 + 0.5) * CFG.WATER_BUBBLE_SPEED;
+    this.wobbleAmp = Math.random() * 3;
+    this.wobbleFreq = 0.001 + Math.random() * 0.003;
+    this.wobblePhase = Math.random() * Math.PI * 2;
+    this.y = CFG.H + Math.random() * 100; // start below screen
+  }
+
+  update(surfaceY) {
+    this.y -= this.speed;
+    // Reset if above water surface
+    if (this.y < surfaceY - 10) {
+      this.reset();
+      this.y = CFG.H + Math.random() * 50;
+    }
+  }
+}
+
+const waterBubbles = [];
+for (let i = 0; i < CFG.WATER_BUBBLE_COUNT; i++) {
+  waterBubbles.push(new WaterBubble());
+}
+
+function drawWater(time) {
+  // Update target Y based on active button count
+  const t = activeCount / 8;
+  waterTargetY = lerp(CFG.H * CFG.WATER_Y_MIN, CFG.H * CFG.WATER_Y_MAX, t);
+  waterCurrentY = lerp(waterCurrentY, waterTargetY, CFG.WATER_LERP_SPEED);
+
+  waterTime = time;
+
+  // Water color: slightly different shade from bg
+  const waterRgb = [
+    currentBgRgb[0] * 0.75,
+    currentBgRgb[1] * 0.85,
+    currentBgRgb[2] * 0.65,
+  ];
+
+  // Draw water surface and body
+  ctx.fillStyle = rgbaToStr(waterRgb, 0.6);
+  ctx.beginPath();
+  ctx.moveTo(0, CFG.H);
+
+  // Build wave path
+  for (let x = 0; x <= CFG.W; x += 3) {
+    const wave1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
+    const wave2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
+    const y = waterCurrentY + wave1 + wave2;
+    ctx.lineTo(x, y);
+  }
+
+  ctx.lineTo(CFG.W, CFG.H);
+  ctx.closePath();
+  ctx.fill();
+
+  // Draw a lighter surface line on top
+  ctx.strokeStyle = rgbaToStr(waterRgb, 0.8);
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 0; x <= CFG.W; x += 3) {
+    const wave1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
+    const wave2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
+    const y = waterCurrentY + wave1 + wave2;
+    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Update and draw water bubbles
+  for (const b of waterBubbles) {
+    b.update(waterCurrentY);
+    if (b.y > waterCurrentY && b.y < CFG.H) {
+      const wobble = Math.sin(time * b.wobbleFreq + b.wobblePhase) * b.wobbleAmp;
+      ctx.fillStyle = rgbaToStr([255, 255, 255], 0.2);
+      ctx.beginPath();
+      ctx.arc(b.x + wobble, b.y, b.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ============================================================
+// IDLE DECORATIVE CIRCLES
+// ============================================================
+class IdleDecorCircle {
+  constructor() {
+    this.x = Math.random() * CFG.W;
+    this.y = Math.random() * CFG.H;
+    this.r = CFG.IDLE_DECOR_MIN_R + Math.random() * (CFG.IDLE_DECOR_MAX_R - CFG.IDLE_DECOR_MIN_R);
+    this.lineWidth = 1 + Math.random() * 1.5;
+    this.alpha = 0.2 + Math.random() * 0.4;
+    this.vx = (Math.random() - 0.5) * 0.15;
+    this.vy = (Math.random() - 0.5) * 0.15;
+  }
+
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    if (this.x < -50) this.x = CFG.W + 50;
+    if (this.x > CFG.W + 50) this.x = -50;
+    if (this.y < -50) this.y = CFG.H + 50;
+    if (this.y > CFG.H + 50) this.y = -50;
+  }
+}
+
+const idleDecorCircles = [];
+for (let i = 0; i < CFG.IDLE_DECOR_COUNT; i++) {
+  idleDecorCircles.push(new IdleDecorCircle());
+}
+
+function drawIdleDecorations(alpha) {
+  for (const c of idleDecorCircles) {
+    c.update();
+    ctx.strokeStyle = rgbaToStr([255, 255, 255], c.alpha * alpha);
+    ctx.lineWidth = c.lineWidth;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+// ============================================================
+// CENTER BUBBLE
+// ============================================================
+let centerBubbleAlpha = 0;
+let centerBubbleRadius = CFG.CENTER_IDLE_RADIUS;
+let centerBubbleY = CFG.H * 0.45;
+let idleRotation = 0;
+
+function drawCenterBubble(time) {
+  let targetR, targetY, fillColor, textColor, text;
+
+  if (currentState === STATE.IDLE) {
+    targetR = CFG.CENTER_IDLE_RADIUS;
+    targetY = CFG.H * 0.42;
+    fillColor = CFG.COLOR_BUBBLE_IDLE;
+    textColor = CFG.COLOR_BUBBLE_ACTIVE;
+    text = 'Dank euch –\nfür die\nGesundheit\naller';
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, 0.03);
+    idleRotation += CFG.IDLE_ROTATE_SPEED * 16;
+  } else if (currentState === STATE.ACTIVE) {
+    const t = clamp((activeCount - 1) / 6, 0, 1); // 1-7 mapped to 0-1
+    targetR = lerp(CFG.CENTER_ACTIVE_MIN_R, CFG.CENTER_ACTIVE_MAX_R, t);
+    targetY = lerp(CFG.H * CFG.CENTER_ACTIVE_MIN_Y, CFG.H * CFG.CENTER_ACTIVE_MAX_Y, t);
+    fillColor = CFG.COLOR_BUBBLE_ACTIVE;
+    textColor = '#FFFFFF';
+    text = 'Gentherapien\nverbessert';
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, 0.05);
+    idleRotation = 0;
+  } else { // FULL
+    targetR = CFG.CENTER_FULL_RADIUS;
+    targetY = CFG.H * 0.40;
+    fillColor = CFG.COLOR_BUBBLE_ACTIVE;
+    textColor = '#FFFFFF';
+    text = 'Deine Daten\nfür die\nGesundheit\naller';
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, 0.03);
+    idleRotation = 0;
+  }
+
+  centerBubbleRadius = lerp(centerBubbleRadius, targetR, 0.04);
+  centerBubbleY = lerp(centerBubbleY, targetY, 0.04);
+
+  const cx = CFG.W / 2;
+  const cy = centerBubbleY;
+
+  ctx.save();
+  ctx.globalAlpha = centerBubbleAlpha;
+
+  // Ring outline
+  if (currentState !== STATE.IDLE) {
+    ctx.strokeStyle = CFG.COLOR_BUBBLE_RING;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, centerBubbleRadius + 8, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Fill circle
+  ctx.fillStyle = fillColor;
+  ctx.beginPath();
+  ctx.arc(cx, cy, centerBubbleRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Text
+  const lines = text.split('\n');
+  const fontSize = Math.max(24, centerBubbleRadius * 0.28);
+  ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = textColor;
+
+  const lineHeight = fontSize * 1.25;
+  const totalHeight = lines.length * lineHeight;
+  const startY = cy - totalHeight / 2 + lineHeight / 2;
+
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i], cx, startY + i * lineHeight);
+  }
+
+  ctx.restore();
+}
+
+// ============================================================
+// TECH RINGS (FULL STATE)
+// ============================================================
+let fullAlpha = 0;
+let fullEnterTime = 0;
+
+function drawTechRings(time) {
+  if (currentState !== STATE.FULL) {
+    fullAlpha = lerp(fullAlpha, 0, 0.05);
+    if (fullAlpha < 0.01) { fullAlpha = 0; return; }
+  } else {
+    if (fullEnterTime === 0) fullEnterTime = time;
+    const elapsed = time - fullEnterTime;
+    const targetAlpha = clamp(elapsed / CFG.TECH_RING_FADE_IN, 0, 1);
+    fullAlpha = lerp(fullAlpha, targetAlpha, 0.03);
+  }
+
+  if (fullAlpha < 0.01) return;
+
+  const cx = CFG.W / 2;
+  const cy = centerBubbleY;
+  const r = centerBubbleRadius;
+
+  ctx.save();
+  ctx.globalAlpha = fullAlpha;
+  ctx.strokeStyle = CFG.COLOR_BUBBLE_RING;
+
+  // Outer rings
+  const ringRadii = [r + 25, r + 40, r + 60];
+  const lineWidths = [1.5, 1, 2];
+
+  for (let ri = 0; ri < ringRadii.length; ri++) {
+    ctx.lineWidth = lineWidths[ri];
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadii[ri], 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Tick marks on outermost ring
+  const tickRing = ringRadii[2];
+  const tickCount = 72;
+  ctx.lineWidth = 1;
+  for (let i = 0; i < tickCount; i++) {
+    const angle = (i / tickCount) * Math.PI * 2;
+    const isMajor = i % 6 === 0;
+    const innerR = tickRing - (isMajor ? 12 : 6);
+    const outerR = tickRing;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(angle) * innerR, cy + Math.sin(angle) * innerR);
+    ctx.lineTo(cx + Math.cos(angle) * outerR, cy + Math.sin(angle) * outerR);
+    ctx.stroke();
+  }
+
+  // Radiating lines (subtle)
+  ctx.lineWidth = 0.5;
+  ctx.globalAlpha = fullAlpha * 0.3;
+  const rayCount = 12;
+  for (let i = 0; i < rayCount; i++) {
+    const angle = (i / rayCount) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(angle) * (tickRing + 5), cy + Math.sin(angle) * (tickRing + 5));
+    ctx.lineTo(cx + Math.cos(angle) * (tickRing + 80), cy + Math.sin(angle) * (tickRing + 80));
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// ============================================================
+// PNG BUBBLE SPAWN SYSTEM
+// ============================================================
+const activeBubbles = [];
+
+const BUBBLE_TEXTS = [
+  'Impfstoff\nentwickelt',
+  'Diagnostik\nverbessert',
+  'Therapie\noptimiert',
+  'Prävention\ngestärkt',
+  'Forschung\ngefördert',
+  'Daten\nanalysiert',
+  'Pflege\ninnoviert',
+  'Versorgung\ngesichert',
+];
+
+function spawnPNGBubble(idx) {
+  // Determine spawn position — spread horizontally based on button index
+  const margin = 120;
+  const span = CFG.W - margin * 2;
+  const x = margin + (idx / 7) * span;
+  const y = CFG.H * 0.35 + Math.random() * CFG.H * 0.2;
+
+  activeBubbles.push({
+    x: x,
+    y: y,
+    startY: y,
+    r: CFG.BUBBLE_START_RADIUS,
+    text: BUBBLE_TEXTS[idx] || 'Beitrag\ngeleistet',
+    startTime: performance.now(),
+    idx: idx,
+  });
+}
+
+function drawPNGBubbles(time) {
+  for (let i = activeBubbles.length - 1; i >= 0; i--) {
+    const b = activeBubbles[i];
+    const elapsed = time - b.startTime;
+    const progress = elapsed / CFG.BUBBLE_SPAWN_DURATION;
+
+    if (progress > 1) {
+      activeBubbles.splice(i, 1);
+      continue;
+    }
+
+    // Position: drift down
+    const driftY = progress * CFG.BUBBLE_DRIFT_Y;
+    const currentY = b.startY + driftY;
+
+    // Scale: shrink
+    const scale = lerp(1, CFG.BUBBLE_SHRINK, progress);
+    const currentR = b.r * scale;
+
+    // Alpha: fade in, then out
+    let bubbleAlpha = 1;
+    let textAlpha = 1;
+
+    // Fade in
+    if (elapsed < CFG.BUBBLE_FADE_IN) {
+      bubbleAlpha = elapsed / CFG.BUBBLE_FADE_IN;
+      textAlpha = bubbleAlpha;
+    }
+
+    // Text fades out earlier
+    const textFadeStart = CFG.BUBBLE_SPAWN_DURATION - CFG.BUBBLE_TEXT_FADE_OUT - CFG.BUBBLE_FADE_OUT;
+    if (elapsed > textFadeStart) {
+      textAlpha = clamp(1 - (elapsed - textFadeStart) / CFG.BUBBLE_TEXT_FADE_OUT, 0, 1);
+    }
+
+    // Bubble fades out at end
+    const bubbleFadeStart = CFG.BUBBLE_SPAWN_DURATION - CFG.BUBBLE_FADE_OUT;
+    if (elapsed > bubbleFadeStart) {
+      bubbleAlpha = clamp(1 - (elapsed - bubbleFadeStart) / CFG.BUBBLE_FADE_OUT, 0, 1);
+    }
+
+    ctx.save();
+
+    // Draw bubble circle
+    ctx.globalAlpha = bubbleAlpha * 0.5;
+    ctx.fillStyle = currentState === STATE.IDLE ? CFG.COLOR_BUBBLE_IDLE : CFG.COLOR_BUBBLE_ACTIVE;
+    ctx.beginPath();
+    ctx.arc(b.x, currentY, currentR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Draw ring
+    ctx.strokeStyle = currentState === STATE.IDLE ? '#FFFFFF' : CFG.COLOR_BUBBLE_RING;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = bubbleAlpha * 0.7;
+    ctx.beginPath();
+    ctx.arc(b.x, currentY, currentR + 4, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Draw text
+    ctx.globalAlpha = textAlpha;
+    const fontSize = Math.max(14, currentR * 0.3);
+    ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = currentState === STATE.IDLE ? CFG.COLOR_BUBBLE_ACTIVE : '#FFFFFF';
+
+    const lines = b.text.split('\n');
+    const lh = fontSize * 1.2;
+    const totalH = lines.length * lh;
+    const sy = currentY - totalH / 2 + lh / 2;
+    for (let li = 0; li < lines.length; li++) {
+      ctx.fillText(lines[li], b.x, sy + li * lh);
+    }
+
+    ctx.restore();
+  }
+}
+
+// ============================================================
+// MAIN RENDER LOOP
+// ============================================================
+let lastTime = 0;
+
+function render(time) {
+  requestAnimationFrame(render);
+
+  // Background color lerp
+  const targetBg = currentState === STATE.IDLE ? RGB_IDLE_BG : RGB_ACTIVE_BG;
+  currentBgRgb = lerpRgb(currentBgRgb, targetBg, CFG.BG_COLOR_LERP);
+
+  // Clear with current bg
+  ctx.fillStyle = rgbToStr(currentBgRgb);
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+
+  // Layer 1: Background network
+  drawBackground();
+
+  // Layer 2: Idle decorative circles (fade with state)
+  if (currentState === STATE.IDLE) {
+    drawIdleDecorations(1);
+  }
+
+  // Layer 3: Water
+  drawWater(time);
+
+  // Layer 4: Center bubble
+  drawCenterBubble(time);
+
+  // Layer 5: Tech rings (Full state)
+  drawTechRings(time);
+
+  // Layer 6: PNG bubbles
+  drawPNGBubbles(time);
+
+  // Reset full enter time when leaving full
+  if (currentState !== STATE.FULL) {
+    fullEnterTime = 0;
+  }
+
+  lastTime = time;
+}
+
+requestAnimationFrame(render);
+
+// ============================================================
+// DEV: Status overlay + on-screen buttons
+// ============================================================
+if (typeof BSSerialPort === 'undefined') {
+  // Status info
+  const devInfo = document.createElement('div');
+  devInfo.style.cssText = 'position:fixed;top:10px;left:10px;color:#fff;font:12px monospace;background:rgba(0,0,0,0.5);padding:8px;border-radius:4px;z-index:999;pointer-events:none;';
+  document.body.appendChild(devInfo);
+
+  setInterval(() => {
+    const stateNames = ['IDLE', 'ACTIVE', 'FULL'];
+    devInfo.innerHTML = `
+      State: ${stateNames[currentState]}<br>
+      Buttons: ${buttons.map((b, i) => b ? (i+1) : '_').join(' ')}<br>
+      Active: ${activeCount}/8<br>
+      Water Y: ${Math.round(waterCurrentY)}<br>
+      Bubbles: ${activeBubbles.length}<br>
+      <span style="color:#aaa">Keys 1-8 or click buttons below</span>
+    `;
+  }, 100);
+
+  // On-screen toggle buttons — avoids keyboard ghosting when testing many buttons at once
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:999;';
+  document.body.appendChild(btnRow);
+
+  const devBtns = [];
+  for (let i = 0; i < 8; i++) {
+    const btn = document.createElement('button');
+    btn.textContent = i + 1;
+    btn.style.cssText = `
+      width:44px;height:44px;border-radius:50%;border:2px solid #fff;
+      background:rgba(0,0,0,0.4);color:#fff;font:bold 16px monospace;
+      cursor:pointer;transition:background 0.1s;user-select:none;
+    `;
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (buttons[i]) onButtonUp(i); else onButtonDown(i);
+    });
+    btnRow.appendChild(btn);
+    devBtns.push(btn);
+  }
+
+  // Keep button visuals in sync with state
+  setInterval(() => {
+    for (let i = 0; i < 8; i++) {
+      devBtns[i].style.background = buttons[i] ? 'rgba(80,160,60,0.85)' : 'rgba(0,0,0,0.4)';
+      devBtns[i].style.borderColor = buttons[i] ? '#90ee60' : '#fff';
+    }
+  }, 50);
+}
+</script>
+</body>
+</html>
