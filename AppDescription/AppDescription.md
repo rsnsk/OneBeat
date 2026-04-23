@@ -2,7 +2,7 @@
 
 ## Context
 - Interactive exhibition installation
-- Display: 1080x1920 portrait (BrightSign HD1025)
+- Display: 1080x1920 portrait (BrightSign HD1026)
 - Rendered as a single-page HTML app with Canvas 2D
 
 ---

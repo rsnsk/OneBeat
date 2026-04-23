@@ -184,62 +184,86 @@ document.addEventListener('keyup', (e) => {
   if (idx !== undefined) onButtonUp(idx);
 });
 
-// -- BrightSign serial (production) --
-let serialIn = null;
-let serialOut = null;
+// -- File logger: writes to SD:/dist/bs-log.txt for offline debugging --
+let _fsLog;
+try {
+  const _fsForLog = require('fs');
+  const _logPath = '/storage/sd/dist/bs-log.txt';
+  _fsForLog.writeFileSync(_logPath, '--- BrightSign log start ---\n');
+  _fsLog = function(msg) {
+    try { _fsForLog.appendFileSync(_logPath, new Date().toISOString() + ' ' + msg + '\n'); } catch(e) {}
+  };
+  const _origLog = console.log, _origWarn = console.warn;
+  console.log = function() { const m = Array.from(arguments).join(' '); _origLog(m); _fsLog('[LOG] ' + m); };
+  console.warn = function() { const m = Array.from(arguments).join(' '); _origWarn(m); _fsLog('[WARN] ' + m); };
+} catch(e) {}
 
-function initBrightSignSerial() {
-  if (typeof BSSerialPort === 'undefined') return;
-  try {
-    // Input: XT-1GW6 touchbuttons
-    serialIn = new BSSerialPort('/dev/ttyUSB0');
-    serialIn.SetBaudRate(9600);
-    serialIn.SetDataBits(8);
-    serialIn.SetStopBits(1);
-    serialIn.SetParity('none');
-
-    let inputBuffer = '';
-    serialIn.ondata = function(data) {
-      inputBuffer += data;
-      let lines = inputBuffer.split('\n');
-      inputBuffer = lines.pop();
-      for (const line of lines) {
-        parseSerialCommand(line.trim());
-      }
-      // Also try parsing without newline for single commands
-      if (inputBuffer.match(/^[1-8][+-]$/)) {
-        parseSerialCommand(inputBuffer);
-        inputBuffer = '';
-      }
-    };
-
-    // Output: Teensy
-    serialOut = new BSSerialPort('/dev/ttyUSB1');
-    serialOut.SetBaudRate(9600);
-    serialOut.SetDataBits(8);
-    serialOut.SetStopBits(1);
-    serialOut.SetParity('none');
-  } catch (e) {
-    console.warn('Serial init failed:', e);
-  }
-}
-
-function parseSerialCommand(cmd) {
-  const match = cmd.match(/^([1-8])([+-])$/);
-  if (!match) return;
-  const idx = parseInt(match[1]) - 1;
-  if (match[2] === '+') {
+// -- Serial input via Node.js fs (BrightSign OS9, nodejs_enabled: true) --
+// Nexmosphere XN-185 / XT-1GW6 ASCII protocol:
+// Format: X{addr}A[{value}]\r\n  — value 3=press, 0=release, addr 001-008
+function parseNexmoLine(line) {
+  const m = line.match(/^X(\d+)A\[(\d+)\]$/);
+  if (!m) return;
+  const addr = parseInt(m[1]);
+  const val  = parseInt(m[2]);
+  const idx  = addr - 1; // 0-based
+  if (idx < 0 || idx > 7) return;
+  if (val === 3) {
+    console.log('Button', addr, 'PRESS');
     onButtonDown(idx);
-  } else {
+  } else if (val === 0) {
+    console.log('Button', addr, 'RELEASE');
     onButtonUp(idx);
   }
-  // Forward to Teensy
-  if (serialOut) {
-    try { serialOut.Write(cmd + '\n'); } catch(e) {}
-  }
 }
 
-initBrightSignSerial();
+try {
+  const fs = require('fs');
+  const { execSync } = require('child_process');
+
+  // Discover available serial devices
+  try {
+    const devs = fs.readdirSync('/dev').filter(f => f.startsWith('ttyS') || f.startsWith('ttyUSB') || f.startsWith('ttyAMA'));
+    console.log('Available serial devices:', devs.join(', '));
+  } catch(e) { console.warn('Cannot list /dev:', e.message); }
+
+  // BrightScript port 0 = likely /dev/ttyS1 on BrightSign (ttyS0 is system console)
+  // Try ttyS1 first, fallback to ttyS0
+  const TOUCH_DEV = '/dev/ttyUSB0';
+  const TOUCH_BAUD = 115200;
+
+  try { execSync('stty -F ' + TOUCH_DEV + ' ' + TOUCH_BAUD + ' cs8 -cstopb -parenb raw -echo'); } catch(e) { console.warn('stty ' + TOUCH_DEV + ':', e.message); }
+
+  console.log('Opening', TOUCH_DEV, 'at', TOUCH_BAUD, 'baud');
+  let lineBuf = '';
+  const serialStream = fs.createReadStream(TOUCH_DEV, { highWaterMark: 64 });
+  serialStream.on('data', function(chunk) {
+    lineBuf += chunk.toString('ascii');
+    let nl;
+    while ((nl = lineBuf.indexOf('\n')) !== -1) {
+      const line = lineBuf.substring(0, nl).replace(/\r$/, '');
+      lineBuf = lineBuf.substring(nl + 1);
+      console.log('Serial line:', line);
+      parseNexmoLine(line);
+    }
+  });
+  serialStream.on('error', function(e) {
+    console.warn('Serial', TOUCH_DEV, 'error:', e.message);
+  });
+
+  // Arduino Nano output (ttyUSB1, 115200 baud)
+  try {
+    execSync('stty -F /dev/ttyUSB1 115200 cs8 -cstopb -parenb raw -echo');
+    const arduinoFd = fs.openSync('/dev/ttyUSB1', 'w');
+    window._arduinoWrite = function(cmd) {
+      try { fs.writeSync(arduinoFd, cmd + '\n'); } catch(e) {}
+    };
+    console.log('Arduino ttyUSB1 ready');
+  } catch(e) { console.warn('Arduino ttyUSB1 not available:', e.message); }
+
+} catch(e) {
+  console.warn('Serial not available (non-BrightSign env):', e);
+}
 
 // ============================================================
 // STATE MACHINE
