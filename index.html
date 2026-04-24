@@ -52,11 +52,12 @@ const CFG = {
   WATER_BUBBLE_SPEED: 0.4,
 
   // Background network
-  BG_DOT_COUNT: 55,
+  BG_DOT_COUNT: 100,
   BG_DOT_SPEED: 0.3,
-  BG_CONNECT_DIST: 50,
+  BG_CONNECT_DIST: 250,
   BG_DOT_RADIUS: 3,
-  BG_LINE_ALPHA: 0.5,
+  BG_LINE_WIDTH: 2,
+  BG_LINE_ALPHA: 0.7,
   BG_DOT_ALPHA: 0.75,
 
   // State transitions
@@ -211,9 +212,11 @@ function parseNexmoLine(line) {
   if (val === 3) {
     console.log('Button', addr, 'PRESS');
     onButtonDown(idx);
+    if (window._arduinoWrite) window._arduinoWrite(addr + '+');
   } else if (val === 0) {
     console.log('Button', addr, 'RELEASE');
     onButtonUp(idx);
+    if (window._arduinoWrite) window._arduinoWrite(addr + '-');
   }
 }
 
@@ -397,7 +400,7 @@ function drawBackground() {
   for (const dot of bgDots) dot.update();
 
   // Draw connections
-  ctx.lineWidth = 1;
+  ctx.lineWidth = CFG.BG_LINE_WIDTH;
   for (let i = 0; i < bgDots.length; i++) {
     for (let j = i + 1; j < bgDots.length; j++) {
       const dx = bgDots[i].x - bgDots[j].x;
