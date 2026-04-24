@@ -12,9 +12,9 @@
 The app has three distinct visual states, driven by how many touchbuttons are currently pressed:
 
 ### State: Idle (0 buttons pressed)
-- **Background**: dark/medium green (`#6B8E4E`), with scattered decorative circle outlines
+- light sage/beige (`#D8DDB5`) with scattered decorative circle outlines
 - **Water line**: below the visible screen area (not visible)
-- **Center bubble**: a large white/cream circle in the center of the screen
+- **Center bubble**: Bubble_idle.png in the center of the screen
   - 2 PNGs fade in at the same position, both centered:
     1. Bubble PNG: circular shape, slowly rotating
     2. Text PNG: text overlay, not rotating (e.g. "Dank euch – für die Gesundheit aller")

@@ -28,7 +28,7 @@ const CFG = {
   H: 1920,
 
   // Colors
-  COLOR_IDLE_BG:     '#6B8E4E',
+  COLOR_IDLE_BG:     '#D8DDB5',
   COLOR_ACTIVE_BG:   '#D8DDB5',
   COLOR_WATER_IDLE:  '#5A7D3A',
   COLOR_WATER_ACTIVE:'#8BA86A',
@@ -743,7 +743,7 @@ function drawCenterBubble(time) {
   // Determine if we use PNGs for this state
   let centerImgSet = null;
   if (CFG.USE_PNG_ASSETS) {
-    if (currentState === STATE.IDLE)  centerImgSet = CENTER_IMGS.idle;
+    if (currentState === STATE.IDLE || currentState === STATE.ACTIVE) centerImgSet = CENTER_IMGS.idle;
     if (currentState === STATE.FULL)  centerImgSet = CENTER_IMGS.full;
   }
   const useCenterPng = centerImgSet &&
