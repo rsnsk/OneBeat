@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=1080, height=1920, initial-scale=1.0">
+<meta name="viewport" content="width=1920, height=1080, initial-scale=1.0">
 <title>OneBeat</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -11,8 +11,7 @@
     display: block;
     position: absolute;
     top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    /* Scaled to fit viewport while maintaining aspect ratio */
+    /* ROTATE_FOR_LANDSCAPE: rotated 90° so portrait canvas fills landscape display */
   }
 </style>
 </head>
@@ -26,19 +25,28 @@ const CFG = {
   // Canvas / display
   W: 1080,
   H: 1920,
+  ROTATE_FOR_LANDSCAPE: true, // rotate canvas 90° to fill a landscape (16:9) screen
 
-  // Colors
+  // Dev overlays (browser-only; ignored on BrightSign)
+  DEV_SHOW_INFO:    true,   // status panel (state, buttons, water Y …)
+  DEV_SHOW_BUTTONS: true,   // on-screen toggle buttons
+  WATER_DECO_FALLBACK: false, // draw generated shapes when PNG not loaded (disable to hide missing assets)
+
   COLOR_IDLE_BG:     '#D8DDB5',
   COLOR_ACTIVE_BG:   '#D8DDB5',
-  COLOR_WATER_IDLE:  '#5A7D3A',
-  COLOR_WATER_ACTIVE:'#8BA86A',
-  COLOR_BUBBLE_IDLE: '#F5F2E8',   // cream/white
-  COLOR_BUBBLE_ACTIVE:'#4A6E2E',  // dark green
+  COLOR_WATER_IDLE:  '#5B7F39',//'#6C984D',
+  COLOR_WATER_ACTIVE: '#5B7F39',//'#6C984D',
+  WATER_FILL_ALPHA:   0.85,       // opacity of water body fill
+  WATER_LINE_ALPHA:   0.9,       // opacity of surface line
+  COLOR_BUBBLE_IDLE: '#F5F2E8',
+  COLOR_BUBBLE_ACTIVE: '#6C984D',
   COLOR_BUBBLE_RING: '#3D5C24',
 
+
   // Water
-  WATER_Y_MIN: 1.05,    // fraction of H (offscreen below) when 0 buttons
-  WATER_Y_MAX: 0.08,    // fraction of H (near top) when 8 buttons
+  // Water level per button count (fraction of canvas H, top of water surface)
+  // Index = number of active buttons (0 = none, 8 = all). Lower value = higher water.
+  WATER_LEVELS: [1.05, 0.84, 0.76, 0.64, 0.52, 0.40, 0.28, 0.17, 0.08],
   WATER_WAVE_AMP1: 12,
   WATER_WAVE_AMP2: 8,
   WATER_WAVE_FREQ1: 0.008,
@@ -52,9 +60,9 @@ const CFG = {
   WATER_BUBBLE_SPEED: 0.4,
 
   // Background network
-  BG_DOT_COUNT: 100,
+  BG_DOT_COUNT: 50,          // fewer dots = O(n²) shrinks fast: 50→ 1225 pairs vs 100→ 4950
   BG_DOT_SPEED: 0.3,
-  BG_CONNECT_DIST: 250,
+  BG_CONNECT_DIST: 180,      // shorter reach = fewer connections drawn
   BG_DOT_RADIUS: 3,
   BG_LINE_WIDTH: 2,
   BG_LINE_ALPHA: 0.7,
@@ -62,14 +70,6 @@ const CFG = {
 
   // State transitions
   BG_COLOR_LERP: 0.03,
-
-  // Center bubble
-  CENTER_IDLE_RADIUS: 250,
-  CENTER_ACTIVE_MIN_R: 80,
-  CENTER_ACTIVE_MAX_R: 200,
-  CENTER_ACTIVE_MIN_Y: 0.78,  // fraction of H (bottom area)
-  CENTER_ACTIVE_MAX_Y: 0.45,  // fraction of H (moves up)
-  CENTER_FULL_RADIUS: 280,
 
   // PNG assets
   USE_PNG_ASSETS: true,           // set false to use generated shapes instead
@@ -79,16 +79,21 @@ const CFG = {
   BUBBLE_FADE_IN: 400,           // ms
   BUBBLE_TEXT_FADE_OUT: 2000,     // ms before end
   BUBBLE_FADE_OUT: 400,          // ms at end
-  BUBBLE_DRIFT_Y: 300,           // px drift down
+  BUBBLE_DRIFT_Y: 900,           // px drift down
   BUBBLE_SHRINK: 0.2,            // final scale factor
   BUBBLE_START_RADIUS: 300,
 
   // Full state
-  FULL_TIMEOUT: 2000,            // ms delay before tech-rings appear
-  TECH_RING_FADE_IN: 1000,       // ms
+  FULL_TIMEOUT: 2000,            // ms delay before entering FULL state
+
+  // Center bubble fade
+  CENTER_BUBBLE_FADE_IN: 0.03,   // lerp speed toward alpha 1 (smaller = slower)
+  CENTER_BUBBLE_FADE_OUT: 0.03,  // lerp speed toward alpha 0 (smaller = slower)
 
   // Idle rotation
-  IDLE_ROTATE_SPEED: 0.0003,     // radians per ms
+  IDLE_ROTATE_SPEED: 0.0003,     // radians per ms (base speed)
+  // Layer rotation speed multipliers (positive = CW, negative = CCW)
+  LAYER_SPEEDS: [0.02, -0.1, 0.1, -0.05],
 
   // Circle decorations (idle state)
   IDLE_DECOR_COUNT: 12,
@@ -98,7 +103,11 @@ const CFG = {
   // Water decoration bubbles (count-driven, inside water)
   WATER_DECO_BIG_R: 55,          // radius of big decoration bubble
   WATER_DECO_SMALL_R: 27,        // radius of small decoration bubble
-  WATER_DECO_SPAWN_DELAY: 3000,   // ms delay after button press before appearing
+  WATER_DECO_SPAWN_DELAY: 3000,  // ms delay after button press before appearing
+  WATER_DECO_WOBBLE_SPEED1: 0.0004, // big bubble wobble frequency (rad/ms)
+  WATER_DECO_WOBBLE_SPEED2: 0.0003, // small bubble wobble frequency (rad/ms)
+  WATER_DECO_WOBBLE_AMP1: 50,     // big bubble vertical wobble amplitude (px)
+  WATER_DECO_WOBBLE_AMP2: 40,     // small bubble vertical wobble amplitude (px)
 };
 
 // ============================================================
@@ -123,9 +132,24 @@ for (let i = 0; i < 8; i++) {
 }
 
 // Center bubble images for Idle and Full states
+// Idle: 2 static layers (bubble base + text) + 4 rotating Layer PNGs
 const CENTER_IMGS = {
-  idle: { bubble: loadImg('assets/Bubble_idle.png'), text: loadImg('assets/Text_idle.png') },
+  idle: {
+    bubble: loadImg('assets/Bubble_idle.png'),
+    layers: [
+      loadImg('assets/Layer1.png'),
+      loadImg('assets/Layer2.png'),
+      loadImg('assets/Layer3.png'),
+      loadImg('assets/Layer4.png'),
+    ],
+    text: loadImg('assets/Text_idle.png'),
+  },
   full: { bubble: loadImg('assets/Bubble_full.png'), text: loadImg('assets/Text_full.png') },
+};
+
+const WATER_DECO_IMGS = {
+  big:   loadImg('assets/WaterBubble_big.png'),
+  small: loadImg('assets/WaterBubble_small.png'),
 };
 
 // ============================================================
@@ -137,11 +161,19 @@ canvas.width = CFG.W;
 canvas.height = CFG.H;
 
 function fitCanvas() {
-  const scaleX = window.innerWidth / CFG.W;
-  const scaleY = window.innerHeight / CFG.H;
-  const scale = Math.min(scaleX, scaleY);
-  canvas.style.width = (CFG.W * scale) + 'px';
-  canvas.style.height = (CFG.H * scale) + 'px';
+  if (CFG.ROTATE_FOR_LANDSCAPE) {
+    // Portrait canvas (W×H) rotated 90° fills landscape screen (H×W).
+    // Scale so the rotated canvas fits the actual viewport.
+    const scale = Math.min(window.innerWidth / CFG.H, window.innerHeight / CFG.W);
+    canvas.style.width  = CFG.W + 'px';
+    canvas.style.height = CFG.H + 'px';
+    canvas.style.transform = `translate(-50%, -50%) rotate(90deg) scale(${scale})`;
+  } else {
+    const scale = Math.min(window.innerWidth / CFG.W, window.innerHeight / CFG.H);
+    canvas.style.width  = (CFG.W * scale) + 'px';
+    canvas.style.height = (CFG.H * scale) + 'px';
+    canvas.style.transform = 'translate(-50%, -50%)';
+  }
 }
 fitCanvas();
 window.addEventListener('resize', fitCanvas);
@@ -328,6 +360,8 @@ function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
 const RGB_IDLE_BG = hexToRgb(CFG.COLOR_IDLE_BG);
 const RGB_ACTIVE_BG = hexToRgb(CFG.COLOR_ACTIVE_BG);
+const RGB_WATER_IDLE = hexToRgb(CFG.COLOR_WATER_IDLE);
+const RGB_WATER_ACTIVE = hexToRgb(CFG.COLOR_WATER_ACTIVE);
 
 let currentBgRgb = [...RGB_IDLE_BG];
 
@@ -389,6 +423,10 @@ function initBgDots() {
 }
 initBgDots();
 
+// Pre-allocated bucket arrays — reused every frame to avoid GC pressure
+const _bgBuckets = Array.from({ length: 8 }, () => []);
+let _bgSkipFrame = false;
+
 function drawBackground() {
   // Determine line/dot color based on current bg (contrast)
   const brightness = (currentBgRgb[0] * 299 + currentBgRgb[1] * 587 + currentBgRgb[2] * 114) / 1000;
@@ -396,40 +434,56 @@ function drawBackground() {
     ? [currentBgRgb[0] * 0.7, currentBgRgb[1] * 0.7, currentBgRgb[2] * 0.7]
     : [currentBgRgb[0] * 1.3, currentBgRgb[1] * 1.3, currentBgRgb[2] * 1.3];
 
-  // Update dots
+  // Always move dots, but only rebuild+draw connections every 2nd frame
   for (const dot of bgDots) dot.update();
+  _bgSkipFrame = !_bgSkipFrame;
+  if (_bgSkipFrame) return;
 
-  // Draw connections
+  // Draw connections — batch all lines sharing the same alpha bucket into one path
+  const BUCKETS = 8;
+  const bucketPaths = _bgBuckets;
+  for (let b = 0; b < BUCKETS; b++) bucketPaths[b].length = 0; // clear without re-allocating
   ctx.lineWidth = CFG.BG_LINE_WIDTH;
+  const connectDistSq = CFG.BG_CONNECT_DIST * CFG.BG_CONNECT_DIST;
   for (let i = 0; i < bgDots.length; i++) {
     for (let j = i + 1; j < bgDots.length; j++) {
       const dx = bgDots[i].x - bgDots[j].x;
       const dy = bgDots[i].y - bgDots[j].y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < CFG.BG_CONNECT_DIST) {
-        const alpha = (1 - dist / CFG.BG_CONNECT_DIST) * CFG.BG_LINE_ALPHA;
-        ctx.strokeStyle = rgbaToStr(lineColor, alpha);
-        ctx.beginPath();
-        ctx.moveTo(bgDots[i].x, bgDots[i].y);
-        ctx.lineTo(bgDots[j].x, bgDots[j].y);
-        ctx.stroke();
+      const distSq = dx * dx + dy * dy;
+      if (distSq < connectDistSq) {
+        const alpha = (1 - Math.sqrt(distSq) / CFG.BG_CONNECT_DIST) * CFG.BG_LINE_ALPHA;
+        const bucket = Math.min(BUCKETS - 1, Math.floor(alpha * BUCKETS));
+        bucketPaths[bucket].push(bgDots[i].x, bgDots[i].y, bgDots[j].x, bgDots[j].y);
       }
     }
   }
-
-  // Draw dots
-  for (const dot of bgDots) {
-    ctx.fillStyle = rgbaToStr(lineColor, CFG.BG_DOT_ALPHA);
+  for (let b = 0; b < BUCKETS; b++) {
+    const pts = bucketPaths[b];
+    if (pts.length === 0) continue;
+    const alpha = (b + 0.5) / BUCKETS * CFG.BG_LINE_ALPHA;
+    ctx.strokeStyle = rgbaToStr(lineColor, alpha);
     ctx.beginPath();
-    ctx.arc(dot.x, dot.y, CFG.BG_DOT_RADIUS, 0, Math.PI * 2);
-    ctx.fill();
+    for (let p = 0; p < pts.length; p += 4) {
+      ctx.moveTo(pts[p], pts[p + 1]);
+      ctx.lineTo(pts[p + 2], pts[p + 3]);
+    }
+    ctx.stroke();
   }
+
+  // Draw dots — batch all into one path (same color/size)
+  ctx.fillStyle = rgbaToStr(lineColor, CFG.BG_DOT_ALPHA);
+  ctx.beginPath();
+  for (const dot of bgDots) {
+    ctx.moveTo(dot.x + CFG.BG_DOT_RADIUS, dot.y);
+    ctx.arc(dot.x, dot.y, CFG.BG_DOT_RADIUS, 0, Math.PI * 2);
+  }
+  ctx.fill();
 }
 
 // ============================================================
 // WATER ANIMATION
 // ============================================================
-let waterTargetY = CFG.H * CFG.WATER_Y_MIN;
+let waterTargetY = CFG.H * CFG.WATER_LEVELS[0];
 let waterCurrentY = waterTargetY;
 let waterTime = 0;
 
@@ -463,87 +517,90 @@ for (let i = 0; i < CFG.WATER_BUBBLE_COUNT; i++) {
 }
 
 // ============================================================
-// WATER DECORATION BUBBLES (persistent, zone-distributed pairs)
+// WATER DECORATION BUBBLES (persistent, position-defined pairs)
 // ============================================================
-// Layout: 4 columns × 2 rows — one slot per button index (0-7)
-//   Buttons 0-3 → row 0 (shallower), columns 0-3
-//   Buttons 4-7 → row 1 (deeper),    columns 0-3
-// Column X centers at W × { 0.125, 0.375, 0.625, 0.875 }
-// Depth expressed as fraction of the current available water height
-// so bubbles automatically spread as the water rises.
+// Positions defined as fractions of canvas W/H (0-1).
+// Index 0 = button 1 (appears first, bottommost), index 7 = button 8 (topmost).
+// Bubbles are clipped to water surface — they become visible as water rises.
+const WATER_DECO_POSITIONS = [
+  { bigX: 0.137, bigY: 0.904, smallX: 0.372, smallY: 0.964 }, // pair 1
+  { bigX: 0.777, bigY: 0.886, smallX: 0.625, smallY: 0.958 }, // pair 2
+  { bigX: 0.316, bigY: 0.765, smallX: 0.540, smallY: 0.874 }, // pair 3
+  { bigX: 0.758, bigY: 0.647, smallX: 0.886, smallY: 0.759 }, // pair 4
+  { bigX: 0.158, bigY: 0.579, smallX: 0.347, smallY: 0.638 }, // pair 5
+  { bigX: 0.537, bigY: 0.458, smallX: 0.796, smallY: 0.519 }, // pair 6
+  { bigX: 0.191, bigY: 0.313, smallX: 0.349, smallY: 0.458 }, // pair 7
+  { bigX: 0.830, bigY: 0.192, smallX: 0.597, smallY: 0.251 }, // pair 8
+];
 
-const ZONE_X_NORM    = [0.125, 0.375, 0.625, 0.875];
-const ZONE_DEPTH_NORM = [0.28, 0.62]; // row 0 = shallower, row 1 = deeper
+// Per-pair stable wobble phase offsets (fixed at page load)
+const waterDecoWobble = Array.from({ length: 8 }, () => ({
+  ph1: Math.random() * Math.PI * 2,
+  ph2: Math.random() * Math.PI * 2,
+}));
 
-// Per-zone stable random offsets (fixed at page load, never change)
-const waterDecoOffsets = Array.from({ length: 8 }, () => {
-  const bigXOff   = (Math.random() - 0.5) * 60;          // ±30 px from column centre
-  const sideSign  = Math.random() > 0.5 ? 1 : -1;
-  const smallXOff = clamp(bigXOff + sideSign * 88, -120, 120); // ~88 px away from big
-  return {
-    bigXOff,
-    smallXOff,
-    bigYOff:  (Math.random() - 0.5) * 30,
-    smallYOff:(Math.random() - 0.5) * 30,
-    wobble1:  Math.random() * Math.PI * 2,
-    wobble2:  Math.random() * Math.PI * 2,
-  };
-});
-
-// Indexed 0-7, matches buttons[]. null = slot inactive.
+// Slots 0-7 map directly to WATER_DECO_POSITIONS — filled by count, not by button identity.
+// Slot 0 = bottommost (first to appear), slot N-1 = topmost (last pressed).
 const waterDecoBubbles = new Array(8).fill(null);
+let waterDecoPrevCount = 0;
 
 function syncWaterDecoBubbles() {
   const now = performance.now();
-  for (let i = 0; i < 8; i++) {
-    if (buttons[i]) {
-      if (!waterDecoBubbles[i]) {
-        waterDecoBubbles[i] = { alpha: 0, removing: false, spawnAt: now + CFG.WATER_DECO_SPAWN_DELAY };
-      }
-    } else {
-      if (waterDecoBubbles[i] && !waterDecoBubbles[i].removing) {
-        waterDecoBubbles[i].removing = true;
+  const count = activeCount;
+
+  if (count > waterDecoPrevCount) {
+    // Buttons pressed: fill new slots from prev count up to count-1
+    for (let slot = waterDecoPrevCount; slot < count; slot++) {
+      const inheritAlpha = waterDecoBubbles[slot]?.alpha ?? 0;
+      waterDecoBubbles[slot] = { alpha: inheritAlpha, removing: false, spawnAt: now + CFG.WATER_DECO_SPAWN_DELAY };
+    }
+  } else if (count < waterDecoPrevCount) {
+    // Buttons released: mark topmost slots as removing
+    for (let slot = count; slot < waterDecoPrevCount; slot++) {
+      if (waterDecoBubbles[slot] && !waterDecoBubbles[slot].removing) {
+        waterDecoBubbles[slot].removing = true;
       }
     }
   }
+
+  waterDecoPrevCount = count;
 }
 
-function drawWaterDecoBubbleShape(x, y, r) {
-  ctx.fillStyle = CFG.COLOR_BUBBLE_ACTIVE;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fill();
+function drawWaterDecoBubbleShape(x, y, r, img) {
+  if (img && img.complete && img.naturalWidth > 0) {
+    ctx.drawImage(img, x - img.naturalWidth / 2, y - img.naturalHeight / 2);
+  } else if (CFG.WATER_DECO_FALLBACK) {
+    // Generated fallback
+    ctx.fillStyle = CFG.COLOR_BUBBLE_ACTIVE;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
 
-  ctx.strokeStyle = CFG.COLOR_BUBBLE_RING;
-  ctx.lineWidth = Math.max(1.5, r * 0.07);
-  ctx.beginPath();
-  ctx.arc(x, y, r + Math.max(3, r * 0.12), 0, Math.PI * 2);
-  ctx.stroke();
+    ctx.strokeStyle = CFG.COLOR_BUBBLE_RING;
+    ctx.lineWidth = Math.max(1.5, r * 0.07);
+    ctx.beginPath();
+    ctx.arc(x, y, r + Math.max(3, r * 0.12), 0, Math.PI * 2);
+    ctx.stroke();
 
-  // Inner-arc highlight
-  ctx.save();
-  ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-  ctx.lineWidth = r * 0.1;
-  ctx.beginPath();
-  ctx.arc(x, y - r * 0.15, r * 0.6, Math.PI * 1.1, Math.PI * 1.9);
-  ctx.stroke();
-  ctx.restore();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = r * 0.1;
+    ctx.beginPath();
+    ctx.arc(x, y - r * 0.15, r * 0.6, Math.PI * 1.1, Math.PI * 1.9);
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawWaterDecorationBubbles(time) {
   const now = performance.now();
   syncWaterDecoBubbles();
 
-  // Pre-compute wave clip path once for all bubbles this frame
-  const waveY = [];
-  for (let x = 0; x <= CFG.W; x += 8) {
-    const w1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
-    const w2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
-    waveY.push(waterCurrentY + w1 + w2);
-  }
+  // Reuse wave points computed by drawWater (called before this each frame)
+  const wavePoints = drawWater._wavePoints || [];
 
-  // Available water height (surface to bottom, with small bottom margin)
-  const waterHeight = Math.max(10, CFG.H - waterCurrentY - 30);
+  // Build clip path once for all non-removing bubbles
+  let clipReady = false;
 
   for (let i = 0; i < 8; i++) {
     const b = waterDecoBubbles[i];
@@ -558,36 +615,42 @@ function drawWaterDecorationBubbles(time) {
 
     if (b.alpha < 0.005) continue;
 
-    const col = i % 4;
-    const row = Math.floor(i / 4);
-    const off = waterDecoOffsets[i];
+    const pos = WATER_DECO_POSITIONS[i];
+    const wob = waterDecoWobble[i];
 
-    // Zone centre in canvas coords
-    const zoneX   = ZONE_X_NORM[col] * CFG.W;
-    const zoneDepth = ZONE_DEPTH_NORM[row] * waterHeight;
+    const wob1 = Math.sin(time * CFG.WATER_DECO_WOBBLE_SPEED1 + wob.ph1) * CFG.WATER_DECO_WOBBLE_AMP1;
+    const wob2 = Math.sin(time * CFG.WATER_DECO_WOBBLE_SPEED2 + wob.ph2) * CFG.WATER_DECO_WOBBLE_AMP2;
 
-    // Gentle float wobble
-    const wob1 = Math.sin(time * 0.0007 + off.wobble1) * 5;
-    const wob2 = Math.sin(time * 0.0009 + off.wobble2) * 4;
-
-    // Final positions — big bubble sits deeper than small
-    const bigX   = clamp(zoneX + off.bigXOff,   CFG.WATER_DECO_BIG_R   + 5, CFG.W - CFG.WATER_DECO_BIG_R   - 5);
-    const bigY   = waterCurrentY + zoneDepth + CFG.WATER_DECO_BIG_R   + off.bigYOff   + wob1;
-    const smallX = clamp(zoneX + off.smallXOff, CFG.WATER_DECO_SMALL_R + 5, CFG.W - CFG.WATER_DECO_SMALL_R - 5);
-    const smallY = waterCurrentY + zoneDepth - CFG.WATER_DECO_BIG_R * 0.4 + off.smallYOff + wob2;
+    const bigX   = pos.bigX   * CFG.W;
+    const bigY   = pos.bigY   * CFG.H + wob1;
+    const smallX = pos.smallX * CFG.W;
+    const smallY = pos.smallY * CFG.H + wob2;
 
     ctx.save();
-    // Clip to water body
-    ctx.beginPath();
-    ctx.moveTo(0, CFG.H);
-    for (let xi = 0; xi < waveY.length; xi++) ctx.lineTo(xi * 8, waveY[xi]);
-    ctx.lineTo(CFG.W, CFG.H);
-    ctx.closePath();
-    ctx.clip();
+    if (!b.removing) {
+      // Apply shared clip once, then reuse by saving state before first clipped bubble
+      if (!clipReady) {
+        ctx.beginPath();
+        ctx.moveTo(0, CFG.H);
+        for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
+        ctx.lineTo(CFG.W, CFG.H);
+        ctx.closePath();
+        ctx.clip();
+        clipReady = true;
+      } else {
+        // Re-apply same clip (ctx.save/restore resets it each iteration)
+        ctx.beginPath();
+        ctx.moveTo(0, CFG.H);
+        for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
+        ctx.lineTo(CFG.W, CFG.H);
+        ctx.closePath();
+        ctx.clip();
+      }
+    }
 
     ctx.globalAlpha = b.alpha;
-    drawWaterDecoBubbleShape(bigX,   bigY,   CFG.WATER_DECO_BIG_R);
-    drawWaterDecoBubbleShape(smallX, smallY, CFG.WATER_DECO_SMALL_R);
+    drawWaterDecoBubbleShape(bigX,   bigY,   CFG.WATER_DECO_BIG_R,   WATER_DECO_IMGS.big);
+    drawWaterDecoBubbleShape(smallX, smallY, CFG.WATER_DECO_SMALL_R, WATER_DECO_IMGS.small);
 
     ctx.restore();
   }
@@ -595,47 +658,45 @@ function drawWaterDecorationBubbles(time) {
 
 function drawWater(time) {
   // Update target Y based on active button count
-  const t = activeCount / 8;
-  waterTargetY = lerp(CFG.H * CFG.WATER_Y_MIN, CFG.H * CFG.WATER_Y_MAX, t);
+  waterTargetY = CFG.WATER_LEVELS[activeCount] * CFG.H;
   waterCurrentY = lerp(waterCurrentY, waterTargetY, CFG.WATER_LERP_SPEED);
 
   waterTime = time;
 
-  // Water color: slightly different shade from bg
+  // Water color: lerp between idle and active based on button count
   const waterRgb = [
-    currentBgRgb[0] * 0.75,
-    currentBgRgb[1] * 0.85,
-    currentBgRgb[2] * 0.65,
+    lerp(RGB_WATER_IDLE[0], RGB_WATER_ACTIVE[0], activeCount / 8),
+    lerp(RGB_WATER_IDLE[1], RGB_WATER_ACTIVE[1], activeCount / 8),
+    lerp(RGB_WATER_IDLE[2], RGB_WATER_ACTIVE[2], activeCount / 8),
   ];
 
-  // Draw water surface and body
-  ctx.fillStyle = rgbaToStr(waterRgb, 0.6);
-  ctx.beginPath();
-  ctx.moveTo(0, CFG.H);
-
-  // Build wave path
-  for (let x = 0; x <= CFG.W; x += 3) {
+  // Build wave points once — reused for fill, stroke, and deco clip
+  const wavePoints = [];
+  for (let x = 0; x <= CFG.W; x += 6) {
     const wave1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
     const wave2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
-    const y = waterCurrentY + wave1 + wave2;
-    ctx.lineTo(x, y);
+    wavePoints.push(x, waterCurrentY + wave1 + wave2);
   }
 
+  // Draw water body (fill)
+  ctx.fillStyle = rgbaToStr(waterRgb, CFG.WATER_FILL_ALPHA);
+  ctx.beginPath();
+  ctx.moveTo(0, CFG.H);
+  for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
   ctx.lineTo(CFG.W, CFG.H);
   ctx.closePath();
   ctx.fill();
 
-  // Draw a lighter surface line on top
-  ctx.strokeStyle = rgbaToStr(waterRgb, 0.8);
+  // Draw surface highlight line (reuse same points)
+  ctx.strokeStyle = rgbaToStr(waterRgb, CFG.WATER_LINE_ALPHA);
   ctx.lineWidth = 2;
   ctx.beginPath();
-  for (let x = 0; x <= CFG.W; x += 3) {
-    const wave1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
-    const wave2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
-    const y = waterCurrentY + wave1 + wave2;
-    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
+  ctx.moveTo(wavePoints[0], wavePoints[1]);
+  for (let p = 2; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
   ctx.stroke();
+
+  // Expose wavePoints for the deco bubble clip (avoids recomputing)
+  drawWater._wavePoints = wavePoints;
 
   // Update and draw water bubbles
   for (const b of waterBubbles) {
@@ -694,24 +755,26 @@ function drawIdleDecorations(alpha) {
 // CENTER BUBBLE
 // ============================================================
 let centerBubbleAlpha = 0;
-let centerBubbleRadius = CFG.CENTER_IDLE_RADIUS;
+let centerBubbleRadius = 1080;  // only used by generated fallback
 let centerBubbleY = CFG.H * 0.45;
 let idleRotation = 0;
+let lastCenterImgSet = null;  // remembers which PNG set was last shown
 
 function drawCenterBubble(time) {
   let targetR, targetY, fillColor, textColor, text;
 
   if (currentState === STATE.IDLE) {
-    targetR = CFG.CENTER_IDLE_RADIUS;
+    targetR = 1080;
     targetY = CFG.H * 0.42;
     fillColor = CFG.COLOR_BUBBLE_IDLE;
     textColor = CFG.COLOR_BUBBLE_ACTIVE;
     text = 'Dank euch –\nfür die\nGesundheit\naller';
-    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, 0.03);
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, CFG.CENTER_BUBBLE_FADE_IN);
     idleRotation += CFG.IDLE_ROTATE_SPEED * 16;
   } else if (currentState === STATE.ACTIVE) {
     // No persistent center bubble in Active state — fade out and return
-    centerBubbleAlpha = lerp(centerBubbleAlpha, 0, 0.05);
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 0, CFG.CENTER_BUBBLE_FADE_OUT);
+    idleRotation += CFG.IDLE_ROTATE_SPEED * 16;
     if (centerBubbleAlpha < 0.01) return;
     // Keep last known targetR/targetY for smooth fade-out (use idle values)
     targetR = centerBubbleRadius;
@@ -719,15 +782,14 @@ function drawCenterBubble(time) {
     fillColor = CFG.COLOR_BUBBLE_IDLE;
     textColor = CFG.COLOR_BUBBLE_ACTIVE;
     text = '';
-    idleRotation = 0;
   } else { // FULL
-    targetR = CFG.CENTER_FULL_RADIUS;
+    targetR = 280;
     targetY = CFG.H * 0.40;
     fillColor = CFG.COLOR_BUBBLE_ACTIVE;
     textColor = '#FFFFFF';
     text = 'Deine Daten\nfür die\nGesundheit\naller';
-    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, 0.03);
-    idleRotation = 0;
+    centerBubbleAlpha = lerp(centerBubbleAlpha, 1, CFG.CENTER_BUBBLE_FADE_IN);
+    idleRotation += CFG.IDLE_ROTATE_SPEED * 16;
   }
 
   centerBubbleRadius = lerp(centerBubbleRadius, targetR, 0.04);
@@ -743,31 +805,52 @@ function drawCenterBubble(time) {
   // Determine if we use PNGs for this state
   let centerImgSet = null;
   if (CFG.USE_PNG_ASSETS) {
-    if (currentState === STATE.IDLE || currentState === STATE.ACTIVE) centerImgSet = CENTER_IMGS.idle;
-    if (currentState === STATE.FULL)  centerImgSet = CENTER_IMGS.full;
+    if (currentState === STATE.IDLE) centerImgSet = CENTER_IMGS.idle;
+    else if (currentState === STATE.FULL) centerImgSet = CENTER_IMGS.full;
+    else centerImgSet = lastCenterImgSet; // ACTIVE: keep fading out what was shown before
   }
+  if (centerImgSet && currentState !== STATE.ACTIVE) lastCenterImgSet = centerImgSet;
   const useCenterPng = centerImgSet &&
                        centerImgSet.bubble.complete &&
                        centerImgSet.bubble.naturalWidth > 0;
 
   if (useCenterPng) {
-    const size = r * 2;
-    const drawX = cx - r;
-    const drawY = cy - r;
-
-    if (currentState === STATE.IDLE && idleRotation !== 0) {
-      // Apply slow rotation to the idle bubble PNG
-      ctx.translate(cx, cy);
-      ctx.rotate(idleRotation);
-      ctx.drawImage(centerImgSet.bubble, -r, -r, size, size);
-      if (centerImgSet.text.complete && centerImgSet.text.naturalWidth > 0) {
-        ctx.rotate(-idleRotation); // text stays upright
-        ctx.drawImage(centerImgSet.text, -r, -r, size, size);
+    if (centerImgSet === CENTER_IMGS.idle) {
+      // Static base at natural resolution
+      const bub = centerImgSet.bubble;
+      if (bub.complete && bub.naturalWidth > 0) {
+        ctx.drawImage(bub, cx - bub.naturalWidth / 2, cy - bub.naturalHeight / 2);
+      }
+      // Rotating layers — each at natural resolution, different speed/direction
+      if (centerImgSet.layers && idleRotation !== 0) {
+        for (let li = 0; li < centerImgSet.layers.length; li++) {
+          const layer = centerImgSet.layers[li];
+          if (!layer.complete || layer.naturalWidth === 0) continue;
+          ctx.save();
+          ctx.translate(cx, cy);
+          ctx.rotate(idleRotation * CFG.LAYER_SPEEDS[li]);
+          ctx.drawImage(layer, -layer.naturalWidth / 2, -layer.naturalHeight / 2);
+          ctx.restore();
+        }
+      } else if (centerImgSet.layers) {
+        // Layers static (during fade-out in ACTIVE state)
+        for (const layer of centerImgSet.layers) {
+          if (layer.complete && layer.naturalWidth > 0)
+            ctx.drawImage(layer, cx - layer.naturalWidth / 2, cy - layer.naturalHeight / 2);
+        }
+      }
+      // Static text on top at natural resolution
+      const txt = centerImgSet.text;
+      if (txt.complete && txt.naturalWidth > 0) {
+        ctx.drawImage(txt, cx - txt.naturalWidth / 2, cy - txt.naturalHeight / 2);
       }
     } else {
-      ctx.drawImage(centerImgSet.bubble, drawX, drawY, size, size);
-      if (centerImgSet.text.complete && centerImgSet.text.naturalWidth > 0) {
-        ctx.drawImage(centerImgSet.text, drawX, drawY, size, size);
+      // FULL image set at natural resolution
+      const bub = centerImgSet.bubble;
+      ctx.drawImage(bub, cx - bub.naturalWidth / 2, cy - bub.naturalHeight / 2);
+      const txt = centerImgSet.text;
+      if (txt.complete && txt.naturalWidth > 0) {
+        ctx.drawImage(txt, cx - txt.naturalWidth / 2, cy - txt.naturalHeight / 2);
       }
     }
   } else {
@@ -805,71 +888,6 @@ function drawCenterBubble(time) {
 // ============================================================
 // TECH RINGS (FULL STATE)
 // ============================================================
-let fullAlpha = 0;
-let fullEnterTime = 0;
-
-function drawTechRings(time) {
-  if (currentState !== STATE.FULL) {
-    fullAlpha = lerp(fullAlpha, 0, 0.05);
-    if (fullAlpha < 0.01) { fullAlpha = 0; return; }
-  } else {
-    if (fullEnterTime === 0) fullEnterTime = time;
-    const elapsed = time - fullEnterTime;
-    const targetAlpha = clamp(elapsed / CFG.TECH_RING_FADE_IN, 0, 1);
-    fullAlpha = lerp(fullAlpha, targetAlpha, 0.03);
-  }
-
-  if (fullAlpha < 0.01) return;
-
-  const cx = CFG.W / 2;
-  const cy = centerBubbleY;
-  const r = centerBubbleRadius;
-
-  ctx.save();
-  ctx.globalAlpha = fullAlpha;
-  ctx.strokeStyle = CFG.COLOR_BUBBLE_RING;
-
-  // Outer rings
-  const ringRadii = [r + 25, r + 40, r + 60];
-  const lineWidths = [1.5, 1, 2];
-
-  for (let ri = 0; ri < ringRadii.length; ri++) {
-    ctx.lineWidth = lineWidths[ri];
-    ctx.beginPath();
-    ctx.arc(cx, cy, ringRadii[ri], 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // Tick marks on outermost ring
-  const tickRing = ringRadii[2];
-  const tickCount = 72;
-  ctx.lineWidth = 1;
-  for (let i = 0; i < tickCount; i++) {
-    const angle = (i / tickCount) * Math.PI * 2;
-    const isMajor = i % 6 === 0;
-    const innerR = tickRing - (isMajor ? 12 : 6);
-    const outerR = tickRing;
-    ctx.beginPath();
-    ctx.moveTo(cx + Math.cos(angle) * innerR, cy + Math.sin(angle) * innerR);
-    ctx.lineTo(cx + Math.cos(angle) * outerR, cy + Math.sin(angle) * outerR);
-    ctx.stroke();
-  }
-
-  // Radiating lines (subtle)
-  ctx.lineWidth = 0.5;
-  ctx.globalAlpha = fullAlpha * 0.3;
-  const rayCount = 12;
-  for (let i = 0; i < rayCount; i++) {
-    const angle = (i / rayCount) * Math.PI * 2;
-    ctx.beginPath();
-    ctx.moveTo(cx + Math.cos(angle) * (tickRing + 5), cy + Math.sin(angle) * (tickRing + 5));
-    ctx.lineTo(cx + Math.cos(angle) * (tickRing + 80), cy + Math.sin(angle) * (tickRing + 80));
-    ctx.stroke();
-  }
-
-  ctx.restore();
-}
-
 // ============================================================
 // PNG BUBBLE SPAWN SYSTEM
 // ============================================================
@@ -887,10 +905,7 @@ const BUBBLE_TEXTS = [
 ];
 
 function spawnPNGBubble(idx) {
-  // Determine spawn position — spread horizontally based on button index
-  const margin = 120;
-  const span = CFG.W - margin * 2;
-  const x = margin + (idx / 7) * span;
+  const x = CFG.W / 2;
   const y = CFG.H * 0.35 + Math.random() * CFG.H * 0.2;
 
   activeBubbles.push({
@@ -937,7 +952,7 @@ function drawPNGBubbles(time) {
     // Text fades out earlier
     const textFadeStart = CFG.BUBBLE_SPAWN_DURATION - CFG.BUBBLE_TEXT_FADE_OUT - CFG.BUBBLE_FADE_OUT;
     if (elapsed > textFadeStart) {
-      textAlpha = clamp(1 - (elapsed - textFadeStart) / CFG.BUBBLE_TEXT_FADE_OUT, 0, 1);
+      textAlpha = clamp(1 - (elapsed - textFadeStart) / CFG.BUBBLE_FADE_OUT, 0, 1);
     }
 
     // Bubble fades out at end
@@ -952,15 +967,20 @@ function drawPNGBubbles(time) {
                    b.imgs.bubble.complete && b.imgs.bubble.naturalWidth > 0;
 
     if (usePng) {
-      // Draw bubble PNG (centered)
-      const size = currentR * 2;
+      // Use drawImage with explicit dst rect — no save/restore/scale/translate needed
+      const bubImg = b.imgs.bubble;
+      const bw = bubImg.naturalWidth * scale;
+      const bh = bubImg.naturalHeight * scale;
       ctx.globalAlpha = bubbleAlpha;
-      ctx.drawImage(b.imgs.bubble, b.x - currentR, currentY - currentR, size, size);
+      ctx.drawImage(bubImg, b.x - bw / 2, currentY - bh / 2, bw, bh);
 
-      // Draw text PNG at same position/size
+      // Draw text PNG
       if (b.imgs.text.complete && b.imgs.text.naturalWidth > 0) {
+        const txtImg = b.imgs.text;
+        const tw = txtImg.naturalWidth * scale;
+        const th = txtImg.naturalHeight * scale;
         ctx.globalAlpha = textAlpha;
-        ctx.drawImage(b.imgs.text, b.x - currentR, currentY - currentR, size, size);
+        ctx.drawImage(txtImg, b.x - tw / 2, currentY - th / 2, tw, th);
       }
     } else {
       // Generated fallback
@@ -1003,8 +1023,26 @@ function drawPNGBubbles(time) {
 // ============================================================
 let lastTime = 0;
 
+// Per-frame timing (ms) — rolling averages exposed to dev overlay
+const _perf = { bg: 0, idle: 0, water: 0, waterDeco: 0, center: 0, png: 0, frame: 0, fps: 0 };
+const _perfAlpha = 0.1; // EMA smoothing (lower = slower/smoother)
+let _lastFrameTime = 0;
+
+function _t(fn) {
+  const t0 = performance.now();
+  fn();
+  return performance.now() - t0;
+}
+
 function render(time) {
   requestAnimationFrame(render);
+
+  const frameStart = performance.now();
+  if (_lastFrameTime > 0) {
+    const dt = frameStart - _lastFrameTime;
+    _perf.fps += _perfAlpha * (1000 / dt - _perf.fps);
+  }
+  _lastFrameTime = frameStart;
 
   // Background color lerp
   const targetBg = currentState === STATE.IDLE ? RGB_IDLE_BG : RGB_ACTIVE_BG;
@@ -1015,30 +1053,24 @@ function render(time) {
   ctx.fillRect(0, 0, CFG.W, CFG.H);
 
   // Layer 1: Background network
-  drawBackground();
+  _perf.bg += _perfAlpha * (_t(() => drawBackground()) - _perf.bg);
 
   // Layer 2: Idle decorative circles (fade with state)
   if (currentState === STATE.IDLE) {
-    drawIdleDecorations(1);
+    _perf.idle += _perfAlpha * (_t(() => drawIdleDecorations(1)) - _perf.idle);
   }
 
   // Layer 3: Water
-  drawWater(time);
-  drawWaterDecorationBubbles(time);
+  _perf.water    += _perfAlpha * (_t(() => drawWater(time))                - _perf.water);
+  _perf.waterDeco += _perfAlpha * (_t(() => drawWaterDecorationBubbles(time)) - _perf.waterDeco);
 
   // Layer 4: Center bubble
-  drawCenterBubble(time);
+  _perf.center += _perfAlpha * (_t(() => drawCenterBubble(time)) - _perf.center);
 
-  // Layer 5: Tech rings (Full state)
-  drawTechRings(time);
+  // Layer 5: PNG bubbles
+  _perf.png += _perfAlpha * (_t(() => drawPNGBubbles(time)) - _perf.png);
 
-  // Layer 6: PNG bubbles
-  drawPNGBubbles(time);
-
-  // Reset full enter time when leaving full
-  if (currentState !== STATE.FULL) {
-    fullEnterTime = 0;
-  }
+  _perf.frame += _perfAlpha * (performance.now() - frameStart - _perf.frame);
 
   lastTime = time;
 }
@@ -1050,23 +1082,41 @@ requestAnimationFrame(render);
 // ============================================================
 if (typeof BSSerialPort === 'undefined') {
   // Status info
+  if (CFG.DEV_SHOW_INFO) {
   const devInfo = document.createElement('div');
   devInfo.style.cssText = 'position:fixed;top:10px;left:10px;color:#fff;font:12px monospace;background:rgba(0,0,0,0.5);padding:8px;border-radius:4px;z-index:999;pointer-events:none;';
   document.body.appendChild(devInfo);
 
   setInterval(() => {
     const stateNames = ['IDLE', 'ACTIVE', 'FULL'];
+    const ms = (v) => v.toFixed(2) + 'ms';
+    const bar = (v, max) => {
+      const pct = Math.min(1, v / max);
+      const color = pct > 0.6 ? '#f55' : pct > 0.3 ? '#fa0' : '#8f8';
+      return `<span style="color:${color}">${ms(v)}</span>`;
+    };
     devInfo.innerHTML = `
       State: ${stateNames[currentState]}<br>
       Buttons: ${buttons.map((b, i) => b ? (i+1) : '_').join(' ')}<br>
       Active: ${activeCount}/8<br>
       Water Y: ${Math.round(waterCurrentY)}<br>
       Bubbles: ${activeBubbles.length}<br>
+      <hr style="border-color:#555;margin:3px 0">
+      FPS: ${_perf.fps.toFixed(1)}<br>
+      Frame total: ${bar(_perf.frame, 16)}<br>
+      &nbsp;BG network: ${bar(_perf.bg, 8)}<br>
+      &nbsp;Idle deco:  ${bar(_perf.idle, 4)}<br>
+      &nbsp;Water:      ${bar(_perf.water, 4)}<br>
+      &nbsp;WaterDeco:  ${bar(_perf.waterDeco, 4)}<br>
+      &nbsp;Center bub: ${bar(_perf.center, 4)}<br>
+      &nbsp;PNG bubs:   ${bar(_perf.png, 4)}<br>
       <span style="color:#aaa">Keys 1-8 or click buttons below</span>
     `;
   }, 100);
+  } // DEV_SHOW_INFO
 
   // On-screen toggle buttons — avoids keyboard ghosting when testing many buttons at once
+  if (CFG.DEV_SHOW_BUTTONS) {
   const btnRow = document.createElement('div');
   btnRow.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:999;';
   document.body.appendChild(btnRow);
@@ -1095,6 +1145,7 @@ if (typeof BSSerialPort === 'undefined') {
       devBtns[i].style.borderColor = buttons[i] ? '#90ee60' : '#fff';
     }
   }, 50);
+  } // DEV_SHOW_BUTTONS
 }
 </script>
 </body>

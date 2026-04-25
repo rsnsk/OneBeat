@@ -53,7 +53,7 @@ The app has three distinct visual states, driven by how many touchbuttons are cu
 
 ---
 
-## PNG Bubble Animation
+## PNG Bubble Animation: TouchBubbles
 - Triggered on each TouchDown event:
   1. 2 PNGs fade in at the same position and size:
      - Bubble PNG: circular bubble shape
