@@ -1,6 +1,6 @@
 # Techstack
 
-- Brightsign Player HD1025
+- Brightsign Player HD1026
 - HTML webpage with Canvas 2D rendering
 - deployment direct via SD Card, if neccessary read : AppDescription\BrighsignDeploy.md
 - 2 serial devices connected:

@@ -114,7 +114,7 @@ const CFG = {
 // ASSET PRELOADER
 // ============================================================
 // Mapping: index 0-7 → { bubble: Image, text: Image }
-// Button 8 (idx 7) uses Bubble_8.png + Bubble_8-1.png as text layer
+// All touch bubbles share one bubble PNG for performance; text layers remain unique.
 const BUBBLE_IMGS = [];
 
 function loadImg(src) {
@@ -123,10 +123,11 @@ function loadImg(src) {
   return img;
 }
 
+const _sharedBubbleImg = loadImg('assets/Bubble_1.png');
 for (let i = 0; i < 8; i++) {
   const n = i + 1;
   BUBBLE_IMGS.push({
-    bubble: loadImg(`assets/Bubble_${n}.png`),
+    bubble: _sharedBubbleImg,
     text:   loadImg(`assets/Text_${n}.png`),
   });
 }
