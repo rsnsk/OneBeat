@@ -28,8 +28,8 @@ const CFG = {
   ROTATE_FOR_LANDSCAPE: true, // rotate canvas 90° to fill a landscape (16:9) screen
 
   // Dev overlays (browser-only; ignored on BrightSign)
-  DEV_SHOW_INFO:    true,   // status panel (state, buttons, water Y …)
-  DEV_SHOW_BUTTONS: true,   // on-screen toggle buttons
+  DEV_SHOW_INFO:    false,   // status panel (state, buttons, water Y …)
+  DEV_SHOW_BUTTONS: false,   // on-screen toggle buttons
   WATER_DECO_FALLBACK: false, // draw generated shapes when PNG not loaded (disable to hide missing assets)
 
   COLOR_IDLE_BG:     '#D8DDB5',
@@ -96,7 +96,7 @@ const CFG = {
   LAYER_SPEEDS: [0.02, -0.1, 0.1, -0.05],
 
   // Circle decorations (idle state)
-  IDLE_DECOR_COUNT: 12,
+  IDLE_DECOR_COUNT: 0,
   IDLE_DECOR_MIN_R: 8,
   IDLE_DECOR_MAX_R: 30,
 
