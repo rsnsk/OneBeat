@@ -264,7 +264,7 @@ try {
 
   // Discover available serial devices
   try {
-    const devs = fs.readdirSync('/dev').filter(f => f.startsWith('ttyS') || f.startsWith('ttyUSB') || f.startsWith('ttyAMA'));
+    const devs = fs.readdirSync('/dev').filter(f => f.startsWith('ttyS') || f.startsWith('ttyUSB') || f.startsWith('ttyAMA') || f.startsWith('ttyACM'));
     console.log('Available serial devices:', devs.join(', '));
   } catch(e) { console.warn('Cannot list /dev:', e.message); }
 
@@ -292,15 +292,16 @@ try {
     console.warn('Serial', TOUCH_DEV, 'error:', e.message);
   });
 
-  // Arduino Nano output (ttyUSB1, 115200 baud)
+  // Teensy output (ttyACM0, 115200 baud) — Teensy uses USB CDC → /dev/ttyACM*
+  const TEENSY_DEV = '/dev/ttyACM0';
   try {
-    execSync('stty -F /dev/ttyUSB1 115200 cs8 -cstopb -parenb raw -echo');
-    const arduinoFd = fs.openSync('/dev/ttyUSB1', 'w');
+    execSync('stty -F ' + TEENSY_DEV + ' 115200 cs8 -cstopb -parenb raw -echo');
+    const teensyFd = fs.openSync(TEENSY_DEV, 'w');
     window._arduinoWrite = function(cmd) {
-      try { fs.writeSync(arduinoFd, cmd + '\n'); } catch(e) {}
+      try { fs.writeSync(teensyFd, cmd + '\n'); } catch(e) {}
     };
-    console.log('Arduino ttyUSB1 ready');
-  } catch(e) { console.warn('Arduino ttyUSB1 not available:', e.message); }
+    console.log('Teensy', TEENSY_DEV, 'ready');
+  } catch(e) { console.warn('Teensy', TEENSY_DEV, 'not available:', e.message); }
 
 } catch(e) {
   console.warn('Serial not available (non-BrightSign env):', e);
