@@ -113,8 +113,8 @@ const CFG = {
 // ============================================================
 // ASSET PRELOADER
 // ============================================================
-// Mapping: index 0-7 → { bubble: Image, text: Image }
-// All touch bubbles share one bubble PNG for performance; text layers remain unique.
+// All touch bubbles share the same bubble PNG — one GPU texture for all 8 slots.
+// Text PNGs differ per slot and may have different natural dimensions.
 const BUBBLE_IMGS = [];
 
 function loadImg(src) {
@@ -127,7 +127,7 @@ const _sharedBubbleImg = loadImg('assets/Bubble_1.png');
 for (let i = 0; i < 8; i++) {
   const n = i + 1;
   BUBBLE_IMGS.push({
-    bubble: _sharedBubbleImg,
+    bubble: _sharedBubbleImg,       // shared: 1 GPU texture for all touch bubbles
     text:   loadImg(`assets/Text_${n}.png`),
   });
 }
@@ -157,7 +157,8 @@ const WATER_DECO_IMGS = {
 // CANVAS SETUP
 // ============================================================
 const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
+// alpha:false tells the compositor this canvas is always opaque → fast compositing path
+const ctx = canvas.getContext('2d', { alpha: false });
 canvas.width = CFG.W;
 canvas.height = CFG.H;
 
@@ -186,14 +187,18 @@ const buttons = new Array(8).fill(false);
 let activeCount = 0;
 
 function updateActiveCount() {
-  activeCount = buttons.filter(Boolean).length;
+  let n = 0;
+  for (let i = 0; i < 8; i++) if (buttons[i]) n++;
+  activeCount = n;
 }
 
 function onButtonDown(idx) {
   if (idx < 0 || idx > 7 || buttons[idx]) return;
   buttons[idx] = true;
   updateActiveCount();
-  spawnPNGBubble(idx);
+  // Only spawn if no bubble from this source is still alive
+  const alreadyAlive = activeBubbles.some(b => b.idx === idx);
+  if (!alreadyAlive) spawnPNGBubble(idx);
   onStateChange();
 }
 
@@ -348,12 +353,11 @@ function rgbaToStr(rgb, a) {
   return `rgba(${Math.round(rgb[0])},${Math.round(rgb[1])},${Math.round(rgb[2])},${a})`;
 }
 
-function lerpRgb(a, b, t) {
-  return [
-    a[0] + (b[0] - a[0]) * t,
-    a[1] + (b[1] - a[1]) * t,
-    a[2] + (b[2] - a[2]) * t,
-  ];
+// Mutates `out` in place — no array allocation per call
+function lerpRgbInto(out, a, b, t) {
+  out[0] = a[0] + (b[0] - a[0]) * t;
+  out[1] = a[1] + (b[1] - a[1]) * t;
+  out[2] = a[2] + (b[2] - a[2]) * t;
 }
 
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -365,6 +369,12 @@ const RGB_WATER_IDLE = hexToRgb(CFG.COLOR_WATER_IDLE);
 const RGB_WATER_ACTIVE = hexToRgb(CFG.COLOR_WATER_ACTIVE);
 
 let currentBgRgb = [...RGB_IDLE_BG];
+const WHITE = [255, 255, 255];
+// Pre-allocated per-frame work buffers (avoid GC churn at 60fps)
+const _waterRgb = [0, 0, 0];
+const _WAVE_POINT_COUNT = Math.ceil(CFG.W / 6) + 1;
+const _wavePoints = new Float32Array(_WAVE_POINT_COUNT * 2);
+let _waveLen = 0; // valid float count in _wavePoints this frame (x,y pairs)
 
 // ============================================================
 // BACKGROUND NETWORK ANIMATION
@@ -424,26 +434,45 @@ function initBgDots() {
 }
 initBgDots();
 
-// Pre-allocated bucket arrays — reused every frame to avoid GC pressure
-const _bgBuckets = Array.from({ length: 8 }, () => []);
-let _bgSkipFrame = false;
+// Offscreen canvas for BG network — rendered every Nth frame, blitted every frame (no flicker)
+const bgCanvas = document.createElement('canvas');
+bgCanvas.width  = CFG.W;
+bgCanvas.height = CFG.H;
+const bgCtx = bgCanvas.getContext('2d', { alpha: false }); // opaque: no alpha compositing
+bgCtx.imageSmoothingEnabled = false; // dots/lines never need bilinear filtering
+
+// Pre-allocated reusables — avoid GC allocation inside the render loop
+const _bgBuckets   = Array.from({ length: 8 }, () => []);
+const _bgLineColor = [0, 0, 0];
+const BG_RENDER_EVERY = 3;             // re-draw network every 3 frames
+let   _bgRenderFrame  = BG_RENDER_EVERY - 1; // trigger render on very first frame
 
 function drawBackground() {
-  // Determine line/dot color based on current bg (contrast)
-  const brightness = (currentBgRgb[0] * 299 + currentBgRgb[1] * 587 + currentBgRgb[2] * 114) / 1000;
-  const lineColor = brightness > 140
-    ? [currentBgRgb[0] * 0.7, currentBgRgb[1] * 0.7, currentBgRgb[2] * 0.7]
-    : [currentBgRgb[0] * 1.3, currentBgRgb[1] * 1.3, currentBgRgb[2] * 1.3];
-
-  // Always move dots, but only rebuild+draw connections every 2nd frame
+  // Move dots every frame so motion stays smooth even when network isn't re-rendered
   for (const dot of bgDots) dot.update();
-  _bgSkipFrame = !_bgSkipFrame;
-  if (_bgSkipFrame) return;
 
-  // Draw connections — batch all lines sharing the same alpha bucket into one path
+  // Only re-render the network every Nth frame
+  _bgRenderFrame++;
+  if (_bgRenderFrame % BG_RENDER_EVERY !== 0) return;
+  _dbgBgRnd = true;
+
+  // Draw onto offscreen canvas (shadowing global ctx)
+  const ctx = bgCtx;
+  // Background fill baked into bgCanvas — eliminates a separate full-screen fillRect on main canvas
+  ctx.fillStyle = rgbToStr(currentBgRgb);
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+
+  // Update line color in place (avoid new array allocation)
+  const brightness = (currentBgRgb[0] * 299 + currentBgRgb[1] * 587 + currentBgRgb[2] * 114) / 1000;
+  const f = brightness > 140 ? 0.7 : 1.3;
+  _bgLineColor[0] = currentBgRgb[0] * f;
+  _bgLineColor[1] = currentBgRgb[1] * f;
+  _bgLineColor[2] = currentBgRgb[2] * f;
+
+  // Batch connections by alpha bucket (one stroke() call per bucket)
   const BUCKETS = 8;
   const bucketPaths = _bgBuckets;
-  for (let b = 0; b < BUCKETS; b++) bucketPaths[b].length = 0; // clear without re-allocating
+  for (let b = 0; b < BUCKETS; b++) bucketPaths[b].length = 0;
   ctx.lineWidth = CFG.BG_LINE_WIDTH;
   const connectDistSq = CFG.BG_CONNECT_DIST * CFG.BG_CONNECT_DIST;
   for (let i = 0; i < bgDots.length; i++) {
@@ -462,7 +491,7 @@ function drawBackground() {
     const pts = bucketPaths[b];
     if (pts.length === 0) continue;
     const alpha = (b + 0.5) / BUCKETS * CFG.BG_LINE_ALPHA;
-    ctx.strokeStyle = rgbaToStr(lineColor, alpha);
+    ctx.strokeStyle = rgbaToStr(_bgLineColor, alpha);
     ctx.beginPath();
     for (let p = 0; p < pts.length; p += 4) {
       ctx.moveTo(pts[p], pts[p + 1]);
@@ -471,8 +500,8 @@ function drawBackground() {
     ctx.stroke();
   }
 
-  // Draw dots — batch all into one path (same color/size)
-  ctx.fillStyle = rgbaToStr(lineColor, CFG.BG_DOT_ALPHA);
+  // Batch all dots into one path + fill
+  ctx.fillStyle = rgbaToStr(_bgLineColor, CFG.BG_DOT_ALPHA);
   ctx.beginPath();
   for (const dot of bgDots) {
     ctx.moveTo(dot.x + CFG.BG_DOT_RADIUS, dot.y);
@@ -597,11 +626,9 @@ function drawWaterDecorationBubbles(time) {
   const now = performance.now();
   syncWaterDecoBubbles();
 
-  // Reuse wave points computed by drawWater (called before this each frame)
-  const wavePoints = drawWater._wavePoints || [];
-
-  // Build clip path once for all non-removing bubbles
-  let clipReady = false;
+  // Apply water clip once for all non-removing bubbles in a single save/restore scope.
+  // (The old per-iteration ctx.save/restore reset the clip every loop — clipReady was a no-op.)
+  let hasClipped = false;
 
   for (let i = 0; i < 8; i++) {
     const b = waterDecoBubbles[i];
@@ -618,7 +645,6 @@ function drawWaterDecorationBubbles(time) {
 
     const pos = WATER_DECO_POSITIONS[i];
     const wob = waterDecoWobble[i];
-
     const wob1 = Math.sin(time * CFG.WATER_DECO_WOBBLE_SPEED1 + wob.ph1) * CFG.WATER_DECO_WOBBLE_AMP1;
     const wob2 = Math.sin(time * CFG.WATER_DECO_WOBBLE_SPEED2 + wob.ph2) * CFG.WATER_DECO_WOBBLE_AMP2;
 
@@ -627,34 +653,31 @@ function drawWaterDecorationBubbles(time) {
     const smallX = pos.smallX * CFG.W;
     const smallY = pos.smallY * CFG.H + wob2;
 
-    ctx.save();
     if (!b.removing) {
-      // Apply shared clip once, then reuse by saving state before first clipped bubble
-      if (!clipReady) {
+      // Clip applied once; all non-removing bubbles share one save/restore scope
+      if (!hasClipped) {
+        ctx.save();
         ctx.beginPath();
         ctx.moveTo(0, CFG.H);
-        for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
+        for (let p = 0; p < _waveLen; p += 2) ctx.lineTo(_wavePoints[p], _wavePoints[p + 1]);
         ctx.lineTo(CFG.W, CFG.H);
         ctx.closePath();
         ctx.clip();
-        clipReady = true;
-      } else {
-        // Re-apply same clip (ctx.save/restore resets it each iteration)
-        ctx.beginPath();
-        ctx.moveTo(0, CFG.H);
-        for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
-        ctx.lineTo(CFG.W, CFG.H);
-        ctx.closePath();
-        ctx.clip();
+        hasClipped = true;
       }
+      ctx.globalAlpha = b.alpha;
+      drawWaterDecoBubbleShape(bigX,   bigY,   CFG.WATER_DECO_BIG_R,   WATER_DECO_IMGS.big);
+      drawWaterDecoBubbleShape(smallX, smallY, CFG.WATER_DECO_SMALL_R, WATER_DECO_IMGS.small);
+    } else {
+      // Removing bubbles fade out without clip
+      ctx.save();
+      ctx.globalAlpha = b.alpha;
+      drawWaterDecoBubbleShape(bigX,   bigY,   CFG.WATER_DECO_BIG_R,   WATER_DECO_IMGS.big);
+      drawWaterDecoBubbleShape(smallX, smallY, CFG.WATER_DECO_SMALL_R, WATER_DECO_IMGS.small);
+      ctx.restore();
     }
-
-    ctx.globalAlpha = b.alpha;
-    drawWaterDecoBubbleShape(bigX,   bigY,   CFG.WATER_DECO_BIG_R,   WATER_DECO_IMGS.big);
-    drawWaterDecoBubbleShape(smallX, smallY, CFG.WATER_DECO_SMALL_R, WATER_DECO_IMGS.small);
-
-    ctx.restore();
   }
+  if (hasClipped) ctx.restore();
 }
 
 function drawWater(time) {
@@ -665,46 +688,40 @@ function drawWater(time) {
   waterTime = time;
 
   // Water color: lerp between idle and active based on button count
-  const waterRgb = [
-    lerp(RGB_WATER_IDLE[0], RGB_WATER_ACTIVE[0], activeCount / 8),
-    lerp(RGB_WATER_IDLE[1], RGB_WATER_ACTIVE[1], activeCount / 8),
-    lerp(RGB_WATER_IDLE[2], RGB_WATER_ACTIVE[2], activeCount / 8),
-  ];
+  lerpRgbInto(_waterRgb, RGB_WATER_IDLE, RGB_WATER_ACTIVE, activeCount / 8);
 
-  // Build wave points once — reused for fill, stroke, and deco clip
-  const wavePoints = [];
+  // Build wave points once into pre-allocated Float32Array — reused for fill, stroke, and deco clip
+  _waveLen = 0;
   for (let x = 0; x <= CFG.W; x += 6) {
     const wave1 = Math.sin(x * CFG.WATER_WAVE_FREQ1 + time * 0.001 * CFG.WATER_WAVE_SPEED1) * CFG.WATER_WAVE_AMP1;
     const wave2 = Math.sin(x * CFG.WATER_WAVE_FREQ2 + time * 0.001 * CFG.WATER_WAVE_SPEED2) * CFG.WATER_WAVE_AMP2;
-    wavePoints.push(x, waterCurrentY + wave1 + wave2);
+    _wavePoints[_waveLen++] = x;
+    _wavePoints[_waveLen++] = waterCurrentY + wave1 + wave2;
   }
 
   // Draw water body (fill)
-  ctx.fillStyle = rgbaToStr(waterRgb, CFG.WATER_FILL_ALPHA);
+  ctx.fillStyle = rgbaToStr(_waterRgb, CFG.WATER_FILL_ALPHA);
   ctx.beginPath();
   ctx.moveTo(0, CFG.H);
-  for (let p = 0; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
+  for (let p = 0; p < _waveLen; p += 2) ctx.lineTo(_wavePoints[p], _wavePoints[p + 1]);
   ctx.lineTo(CFG.W, CFG.H);
   ctx.closePath();
   ctx.fill();
 
   // Draw surface highlight line (reuse same points)
-  ctx.strokeStyle = rgbaToStr(waterRgb, CFG.WATER_LINE_ALPHA);
+  ctx.strokeStyle = rgbaToStr(_waterRgb, CFG.WATER_LINE_ALPHA);
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(wavePoints[0], wavePoints[1]);
-  for (let p = 2; p < wavePoints.length; p += 2) ctx.lineTo(wavePoints[p], wavePoints[p + 1]);
+  ctx.moveTo(_wavePoints[0], _wavePoints[1]);
+  for (let p = 2; p < _waveLen; p += 2) ctx.lineTo(_wavePoints[p], _wavePoints[p + 1]);
   ctx.stroke();
-
-  // Expose wavePoints for the deco bubble clip (avoids recomputing)
-  drawWater._wavePoints = wavePoints;
 
   // Update and draw water bubbles
   for (const b of waterBubbles) {
     b.update(waterCurrentY);
     if (b.y > waterCurrentY && b.y < CFG.H) {
       const wobble = Math.sin(time * b.wobbleFreq + b.wobblePhase) * b.wobbleAmp;
-      ctx.fillStyle = rgbaToStr([255, 255, 255], 0.2);
+      ctx.fillStyle = rgbaToStr(WHITE, 0.2);
       ctx.beginPath();
       ctx.arc(b.x + wobble, b.y, b.r, 0, Math.PI * 2);
       ctx.fill();
@@ -922,6 +939,9 @@ function spawnPNGBubble(idx) {
 }
 
 function drawPNGBubbles(time) {
+  // Draw directly to main ctx — background is blit from bgCanvas each frame.
+  _dbgBubRnd = true;
+
   for (let i = activeBubbles.length - 1; i >= 0; i--) {
     const b = activeBubbles[i];
     const elapsed = time - b.startTime;
@@ -944,39 +964,33 @@ function drawPNGBubbles(time) {
     let bubbleAlpha = 1;
     let textAlpha = 1;
 
-    // Fade in
     if (elapsed < CFG.BUBBLE_FADE_IN) {
       bubbleAlpha = elapsed / CFG.BUBBLE_FADE_IN;
       textAlpha = bubbleAlpha;
     }
 
-    // Text fades out earlier
     const textFadeStart = CFG.BUBBLE_SPAWN_DURATION - CFG.BUBBLE_TEXT_FADE_OUT - CFG.BUBBLE_FADE_OUT;
     if (elapsed > textFadeStart) {
       textAlpha = clamp(1 - (elapsed - textFadeStart) / CFG.BUBBLE_FADE_OUT, 0, 1);
     }
 
-    // Bubble fades out at end
     const bubbleFadeStart = CFG.BUBBLE_SPAWN_DURATION - CFG.BUBBLE_FADE_OUT;
     if (elapsed > bubbleFadeStart) {
       bubbleAlpha = clamp(1 - (elapsed - bubbleFadeStart) / CFG.BUBBLE_FADE_OUT, 0, 1);
     }
 
-    ctx.save();
-
     const usePng = CFG.USE_PNG_ASSETS && b.imgs &&
                    b.imgs.bubble.complete && b.imgs.bubble.naturalWidth > 0;
 
     if (usePng) {
-      // Use drawImage with explicit dst rect — no save/restore/scale/translate needed
       const bubImg = b.imgs.bubble;
       const bw = bubImg.naturalWidth * scale;
       const bh = bubImg.naturalHeight * scale;
       ctx.globalAlpha = bubbleAlpha;
       ctx.drawImage(bubImg, b.x - bw / 2, currentY - bh / 2, bw, bh);
 
-      // Draw text PNG
-      if (b.imgs.text.complete && b.imgs.text.naturalWidth > 0) {
+      // Text: original PNG, centered using its own natural dimensions
+      if (textAlpha > 0.005) {
         const txtImg = b.imgs.text;
         const tw = txtImg.naturalWidth * scale;
         const th = txtImg.naturalHeight * scale;
@@ -991,7 +1005,6 @@ function drawPNGBubbles(time) {
       ctx.arc(b.x, currentY, currentR, 0, Math.PI * 2);
       ctx.fill();
 
-      // Ring
       ctx.strokeStyle = currentState === STATE.IDLE ? '#FFFFFF' : CFG.COLOR_BUBBLE_RING;
       ctx.lineWidth = 2;
       ctx.globalAlpha = bubbleAlpha * 0.7;
@@ -999,7 +1012,6 @@ function drawPNGBubbles(time) {
       ctx.arc(b.x, currentY, currentR + 4, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Text
       ctx.globalAlpha = textAlpha;
       const fontSize = Math.max(14, currentR * 0.3);
       ctx.font = `bold ${fontSize}px Arial, sans-serif`;
@@ -1015,68 +1027,148 @@ function drawPNGBubbles(time) {
       }
     }
 
-    ctx.restore();
+    ctx.globalAlpha = 1; // reset for next bubble
   }
 }
 
 // ============================================================
 // MAIN RENDER LOOP
 // ============================================================
-let lastTime = 0;
-
 // Per-frame timing (ms) — rolling averages exposed to dev overlay
 const _perf = { bg: 0, idle: 0, water: 0, waterDeco: 0, center: 0, png: 0, frame: 0, fps: 0 };
 const _perfAlpha = 0.1; // EMA smoothing (lower = slower/smoother)
 let _lastFrameTime = 0;
 
-function _t(fn) {
-  const t0 = performance.now();
-  fn();
-  return performance.now() - t0;
-}
+// Spike capture: raw per-phase timing logged when wall-clock frame gap > threshold
+const _SPIKE_MS = 25;    // ms — frames slower than this are captured (< 40fps)
+const _spikeLog = [];    // ring buffer, last 6 spike frames
+// Frame-time ring buffer for graph (pre-allocated, zero-copy)
+const _ftBuf = new Float32Array(120);
+let _ftIdx = 0;
+// Which offscreen canvases were re-drawn this frame (set by draw functions, reset each frame)
+let _dbgBgRnd = false;
+let _dbgBubRnd = false;
+
+const _TARGET_FRAME_MS = 1000 / 60; // cap to 60fps — rAF fires at monitor Hz (e.g. 144Hz on desktop)
+let _lastRenderTime = 0;
 
 function render(time) {
   requestAnimationFrame(render);
 
+  // Skip frame if we're ahead of 60fps target (desktop high-refresh monitors)
+  if (time - _lastRenderTime < _TARGET_FRAME_MS - 1) return;
+  _lastRenderTime = time;
+
   const frameStart = performance.now();
+  _dbgBgRnd = false;
+  _dbgBubRnd = false;
+  let _frameDt = 0;
   if (_lastFrameTime > 0) {
-    const dt = frameStart - _lastFrameTime;
-    _perf.fps += _perfAlpha * (1000 / dt - _perf.fps);
+    _frameDt = frameStart - _lastFrameTime;
+    _perf.fps += _perfAlpha * (1000 / _frameDt - _perf.fps);
   }
   _lastFrameTime = frameStart;
 
-  // Background color lerp
+  // Background color lerp — mutate in place, no array allocation
   const targetBg = currentState === STATE.IDLE ? RGB_IDLE_BG : RGB_ACTIVE_BG;
-  currentBgRgb = lerpRgb(currentBgRgb, targetBg, CFG.BG_COLOR_LERP);
+  lerpRgbInto(currentBgRgb, currentBgRgb, targetBg, CFG.BG_COLOR_LERP);
 
-  // Clear with current bg
-  ctx.fillStyle = rgbToStr(currentBgRgb);
-  ctx.fillRect(0, 0, CFG.W, CFG.H);
+  // Layer 1: BG network (includes background fill) — re-render offscreen every 3rd frame, blit every frame
+  // bgCanvas now contains the background color fill, so no separate fillRect needed on main canvas
+  let _t0 = performance.now();
+  drawBackground();
+  ctx.drawImage(bgCanvas, 0, 0);
+  const _rawBg = performance.now() - _t0;
+  _perf.bg += _perfAlpha * (_rawBg - _perf.bg);
 
-  // Layer 1: Background network
-  _perf.bg += _perfAlpha * (_t(() => drawBackground()) - _perf.bg);
-
-  // Layer 2: Idle decorative circles (fade with state)
-  if (currentState === STATE.IDLE) {
-    _perf.idle += _perfAlpha * (_t(() => drawIdleDecorations(1)) - _perf.idle);
-  }
+  // Layer 2: Idle decorative circles
+  _t0 = performance.now();
+  if (currentState === STATE.IDLE) drawIdleDecorations(1);
+  const _rawIdle = performance.now() - _t0;
+  _perf.idle += _perfAlpha * (_rawIdle - _perf.idle);
 
   // Layer 3: Water
-  _perf.water    += _perfAlpha * (_t(() => drawWater(time))                - _perf.water);
-  _perf.waterDeco += _perfAlpha * (_t(() => drawWaterDecorationBubbles(time)) - _perf.waterDeco);
+  _t0 = performance.now();
+  drawWater(time);
+  const _rawWater = performance.now() - _t0;
+  _perf.water += _perfAlpha * (_rawWater - _perf.water);
+
+  _t0 = performance.now();
+  drawWaterDecorationBubbles(time);
+  const _rawWaterDeco = performance.now() - _t0;
+  _perf.waterDeco += _perfAlpha * (_rawWaterDeco - _perf.waterDeco);
 
   // Layer 4: Center bubble
-  _perf.center += _perfAlpha * (_t(() => drawCenterBubble(time)) - _perf.center);
+  _t0 = performance.now();
+  drawCenterBubble(time);
+  const _rawCenter = performance.now() - _t0;
+  _perf.center += _perfAlpha * (_rawCenter - _perf.center);
 
-  // Layer 5: PNG bubbles
-  _perf.png += _perfAlpha * (_t(() => drawPNGBubbles(time)) - _perf.png);
+  // Layer 5: PNG bubbles — drawn directly to ctx (main canvas cleared by fillRect every frame)
+  _t0 = performance.now();
+  drawPNGBubbles(time);
+  const _rawPng = performance.now() - _t0;
+  _perf.png += _perfAlpha * (_rawPng - _perf.png);
 
-  _perf.frame += _perfAlpha * (performance.now() - frameStart - _perf.frame);
+  const _rawFrame = performance.now() - frameStart;
+  _perf.frame += _perfAlpha * (_rawFrame - _perf.frame);
 
-  lastTime = time;
+  // Frame-time ring buffer for graph
+  _ftBuf[_ftIdx % 120] = _frameDt;
+  _ftIdx++;
+
+  // Spike log: capture raw per-phase breakdown when wall-clock gap is large
+  if (_frameDt > _SPIKE_MS) {
+    _spikeLog.push({
+      dt:  Math.round(_frameDt),
+      fr:  _rawFrame.toFixed(1),
+      bg:  _rawBg.toFixed(1),
+      id:  _rawIdle.toFixed(1),
+      wt:  _rawWater.toFixed(1),
+      wd:  _rawWaterDeco.toFixed(1),
+      cn:  _rawCenter.toFixed(1),
+      png: _rawPng.toFixed(1),
+      bubs: activeBubbles.length,
+      bR: _dbgBgRnd ? 1 : 0,   // was bgCanvas redrawn this frame?
+      pR: _dbgBubRnd ? 1 : 0   // was bubbleCanvas redrawn this frame?
+    });
+    if (_spikeLog.length > 6) _spikeLog.shift();
+  }
 }
 
 requestAnimationFrame(render);
+
+// ============================================================
+// GPU TEXTURE PRE-WARM
+// Force every PNG onto the GPU now, before any button press.
+// Without this, each image's first drawImage() triggers a GPU
+// texture upload in the same frame — causing a visible stutter.
+// Drawing at globalAlpha=0.001 (not 0) ensures the engine
+// doesn't skip the upload as a no-op.
+// ============================================================
+function prewarmImage(img) {
+  const go = () => {
+    const prevAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = 0.001;
+    ctx.drawImage(img, 0, 0, 1, 1);
+    ctx.globalAlpha = prevAlpha;
+  };
+  if (img.complete && img.naturalWidth > 0) go();
+  else img.addEventListener('load', go, { once: true });
+}
+
+// Prewarm all PNGs so GPU texture is resident before first draw
+prewarmImage(_sharedBubbleImg);
+for (let i = 0; i < 8; i++) {
+  prewarmImage(BUBBLE_IMGS[i].text);
+}
+prewarmImage(CENTER_IMGS.idle.bubble);
+prewarmImage(CENTER_IMGS.idle.text);
+for (const layer of CENTER_IMGS.idle.layers) prewarmImage(layer);
+prewarmImage(CENTER_IMGS.full.bubble);
+prewarmImage(CENTER_IMGS.full.text);
+prewarmImage(WATER_DECO_IMGS.big);
+prewarmImage(WATER_DECO_IMGS.small);
 
 // ============================================================
 // DEV: Status overlay + on-screen buttons
@@ -1087,6 +1179,13 @@ if (typeof BSSerialPort === 'undefined') {
   const devInfo = document.createElement('div');
   devInfo.style.cssText = 'position:fixed;top:10px;left:10px;color:#fff;font:12px monospace;background:rgba(0,0,0,0.5);padding:8px;border-radius:4px;z-index:999;pointer-events:none;';
   document.body.appendChild(devInfo);
+
+  // Frame-time bar graph: 120px wide, 40px tall, green=ok orange=warn red=stutter
+  const ftGraph = document.createElement('canvas');
+  ftGraph.width = 120; ftGraph.height = 40;
+  ftGraph.style.cssText = 'position:fixed;top:10px;left:350px;z-index:999;border:1px solid #555;background:#111;image-rendering:pixelated;';
+  document.body.appendChild(ftGraph);
+  const ftGraphCtx = ftGraph.getContext('2d');
 
   setInterval(() => {
     const stateNames = ['IDLE', 'ACTIVE', 'FULL'];
@@ -1111,8 +1210,26 @@ if (typeof BSSerialPort === 'undefined') {
       &nbsp;WaterDeco:  ${bar(_perf.waterDeco, 4)}<br>
       &nbsp;Center bub: ${bar(_perf.center, 4)}<br>
       &nbsp;PNG bubs:   ${bar(_perf.png, 4)}<br>
+      <hr style="border-color:#555;margin:3px 0">
+      Spikes &gt;${_SPIKE_MS}ms (newest first):<br>
+      ${_spikeLog.length === 0
+        ? '<span style="color:#8f8">none</span>'
+        : _spikeLog.slice().reverse().map(s =>
+            `<span style="color:#fa0">dt:${s.dt} fr:${s.fr} b:${s.bubs} bgR:${s.bR} pbR:${s.pR}</span> bg:${s.bg} id:${s.id} wt:${s.wt} wd:${s.wd} cn:${s.cn} png:${s.png}`
+          ).join('<br>')
+      }<br>
       <span style="color:#aaa">Keys 1-8 or click buttons below</span>
     `;
+    // Frame-time bar graph — drawn on a persistent canvas, not in innerHTML
+    const n = Math.min(_ftIdx, 120);
+    const start = _ftIdx > 120 ? _ftIdx % 120 : 0;
+    ftGraphCtx.clearRect(0, 0, 120, 40);
+    for (let i = 0; i < n; i++) {
+      const v = _ftBuf[(start + i) % 120];
+      const h = Math.min(40, (v / 50) * 40); // 50ms = full height
+      ftGraphCtx.fillStyle = v > 33 ? '#f55' : v > 20 ? '#fa0' : '#8f8';
+      ftGraphCtx.fillRect(i, 40 - h, 1, h);
+    }
   }, 100);
   } // DEV_SHOW_INFO
 
